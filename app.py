@@ -117,18 +117,16 @@ hr { border-color: rgba(15,23,42,0.08) !important; }
 
 #MainMenu {visibility:hidden;}
 footer {visibility:hidden;}
-header {visibility:hidden;}
+/* DON'T hide the header; it contains the sidebar toggle */
+/* header {visibility:hidden;} */
+
 </style>
 """, unsafe_allow_html=True)
 
+# ================== STORAGE: SUPABASE ==================
+from supabase import create_client
 
-# ================== FILE SETUP ==================
-os.makedirs("data", exist_ok=True)
-BACKUP_DIR = "data/_backups"
-EXPORT_DIR = "data/_exports"
-os.makedirs(BACKUP_DIR, exist_ok=True)
-os.makedirs(EXPORT_DIR, exist_ok=True)
-
+# Keep same "file names" so your app code doesn't change
 RETAILERS_FILE = "data/retailers.csv"
 CATEGORIES_FILE = "data/categories.csv"
 PRICES_FILE = "data/prices.csv"
@@ -142,12 +140,54 @@ EXPENSES_FILE = "data/expenses.csv"
 
 GLOBAL_RETAILER_ID = -1
 
-# ================== SAFETY SETTINGS ==================
-BACKUPS_PER_FILE = 10
-LOCK_RETRIES = 60
-LOCK_SLEEP_SEC = 0.15
-STALE_LOCK_SEC = 180  # consider lock stale after 3 minutes (single-user machine safety)
+FILE_TO_TABLE = {
+    RETAILERS_FILE: ("retailers", "retailer_id"),
+    CATEGORIES_FILE: ("categories", "category_id"),
+    PRICES_FILE: ("prices", "price_id"),
+    ENTRIES_FILE: ("entries", "entry_id"),
+    PAYMENTS_FILE: ("payments", "payment_id"),
+    DISTRIBUTORS_FILE: ("distributors", "distributor_id"),
+    DISTRIBUTOR_PURCHASES_FILE: ("distributor_purchases", "purchase_id"),
+    DISTRIBUTOR_PAYMENTS_FILE: ("distributor_payments", "payment_id"),
+    WASTAGE_FILE: ("wastage", "wastage_id"),
+    EXPENSES_FILE: ("expenses", "expense_id"),
+}
 
+@st.cache_resource
+def get_sb():
+    return create_client(
+        st.secrets["supabase"]["url"],
+        st.secrets["supabase"]["anon_key"]
+    )
+
+sb = None
+try:
+    sb = get_sb()
+except Exception as e:
+    st.error("Supabase client init failed. Check .streamlit/secrets.toml and supabase dependency.")
+    st.error(str(e))
+    st.stop()
+
+if st.sidebar.button("🔌 Test DB Connection"):
+    try:
+        sb.table("retailers").select("retailer_id").limit(1).execute()
+        st.sidebar.success("Supabase connected ✅")
+    except Exception as e:
+        st.sidebar.error(f"Connection failed ❌\n{e}")
+
+
+def _secret_bool(key: str, default: bool = False) -> bool:
+    try:
+        raw = st.secrets["supabase"].get(key, default)
+    except Exception:
+        return default
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(raw)
+
+# Toggle DB-assigned IDs and server-side filtering via secrets if desired.
+USE_DB_IDS = _secret_bool("use_db_ids", False)
+USE_SERVER_FILTERS = _secret_bool("use_server_filters", True)
 # ================== SCHEMAS ==================
 CSV_SCHEMAS = {
     RETAILERS_FILE: ["retailer_id", "name", "contact", "address", "zone", "is_active"],
@@ -170,91 +210,6 @@ ALLOWED_LEGACY_MISSING = {
 }
 
 # ================== HELPERS ==================
-def _ts() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-def _lock_path(path: str) -> str:
-    return os.path.abspath(path) + ".lock"
-
-def _lock_is_stale(lp: str) -> bool:
-    try:
-        mtime = os.path.getmtime(lp)
-        return (time.time() - mtime) > STALE_LOCK_SEC
-    except OSError:
-        return False
-
-def acquire_lock(path: str) -> None:
-    path_abs = os.path.abspath(path)
-    lp = _lock_path(path_abs)
-
-    for _ in range(LOCK_RETRIES):
-        try:
-            fd = os.open(lp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"pid={os.getpid()} time={datetime.now().isoformat()}".encode("utf-8"))
-            os.close(fd)
-            return
-        except FileExistsError:
-            if _lock_is_stale(lp):
-                try:
-                    os.remove(lp)
-                    st.warning(f"⚠️ Removed stale lock: {os.path.basename(lp)}")
-                    continue
-                except OSError:
-                    pass
-            time.sleep(LOCK_SLEEP_SEC)
-
-    raise TimeoutError(f"Could not acquire lock for {path_abs}. Close other programs using CSVs and retry.")
-
-def release_lock(path: str) -> None:
-    lp = _lock_path(path)
-    try:
-        if os.path.exists(lp):
-            os.remove(lp)
-    except OSError:
-        pass
-
-def ensure_csv_if_missing(path: str, columns: list[str]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if not os.path.exists(path):
-        pd.DataFrame(columns=columns).to_csv(path, index=False, encoding="utf-8-sig")
-
-def quarantine_corrupt_file(path: str) -> str:
-    if not os.path.exists(path):
-        return ""
-    qpath = f"{path}.CORRUPT_{_ts()}.bak"
-    try:
-        os.replace(path, qpath)
-    except OSError:
-        shutil.copy2(path, qpath)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-    return qpath
-
-def rotate_backups_for(base_name: str) -> None:
-    backups = []
-    for fn in os.listdir(BACKUP_DIR):
-        if fn.startswith(base_name + ".") and fn.endswith(".bak"):
-            backups.append(os.path.join(BACKUP_DIR, fn))
-    backups.sort(reverse=True)
-    for p in backups[BACKUPS_PER_FILE:]:
-        try:
-            os.remove(p)
-        except OSError:
-            pass
-
-def backup_before_write(path: str) -> None:
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        return
-    base = os.path.basename(path)
-    bname = f"{base}.{_ts()}.bak"
-    bpath = os.path.join(BACKUP_DIR, bname)
-    try:
-        shutil.copy2(path, bpath)
-        rotate_backups_for(base)
-    except Exception:
-        pass
 def _is_missingish(v) -> bool:
     if v is None:
         return True
@@ -276,215 +231,460 @@ def _disp_2dec_or_dash(v, dash="–") -> str:
 def _disp_rate_or_dash(v, dash="–") -> str:
     """Rate display: 2 decimals, but keep dash for missing. 0 => dash."""
     return _disp_2dec_or_dash(v, dash=dash)
+# ================== DB WRITE HELPERS (SAFE, TARGETED) ==================
+def sb_table_for_path(path: str) -> tuple[str, str]:
+    if path not in FILE_TO_TABLE:
+        raise ValueError(f"Unknown mapping for: {path}")
+    return FILE_TO_TABLE[path]
 
 
-def safe_write_csv(df: pd.DataFrame, path: str, retries: int = 25, delay_sec: float = 0.20) -> None:
-    folder = os.path.dirname(os.path.abspath(path))
-    os.makedirs(folder, exist_ok=True)
-    path_abs = os.path.abspath(path)
-
-    acquire_lock(path_abs)
+def sb_next_id(table: str, pk: str) -> int:
+    """
+    Get next integer ID safely from DB (max(pk)+1).
+    Prevents collisions across multiple sessions/users.
+    """
+    resp = sb.table(table).select(pk).order(pk, desc=True).limit(1).execute()
+    data = resp.data or []
+    if not data:
+        return 1
     try:
-        last_err = None
-        for attempt in range(retries):
-            fd, tmp_path = tempfile.mkstemp(prefix="tmp_", suffix=".csv", dir=folder)
-            os.close(fd)
-            try:
-                df.to_csv(tmp_path, index=False, encoding="utf-8-sig")
-                backup_before_write(path_abs)
+        return int(data[0][pk]) + 1
+    except Exception:
+        return 1
 
-                try:
-                    os.replace(tmp_path, path_abs)
-                    return
-                except PermissionError as e:
-                    last_err = e
-                    time.sleep(delay_sec * (1 + attempt * 0.15))
-                finally:
-                    if os.path.exists(tmp_path):
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
-            except Exception as e:
-                last_err = e
-                if os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-                time.sleep(delay_sec * (1 + attempt * 0.15))
 
-        raise PermissionError(
-            f"Could not write '{path_abs}'. Close anything using it (Excel/preview/antivirus)."
-        ) from last_err
-    finally:
-        release_lock(path_abs)
+def sb_new_id(table: str, pk: str):
+    return None if USE_DB_IDS else sb_next_id(table, pk)
 
-def safe_write_two_csvs(df1: pd.DataFrame, path1: str, df2: pd.DataFrame, path2: str) -> None:
-    p1 = os.path.abspath(path1)
-    p2 = os.path.abspath(path2)
-    ordered = sorted([(p1, df1), (p2, df2)], key=lambda x: x[0])
-    acquired = []
-    try:
-        for p, _df in ordered:
-            acquire_lock(p)
-            acquired.append(p)
-        for p, _df in ordered:
-            folder = os.path.dirname(p)
-            os.makedirs(folder, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(prefix="tmp_", suffix=".csv", dir=folder)
-            os.close(fd)
-            try:
-                _df.to_csv(tmp_path, index=False, encoding="utf-8-sig")
-                backup_before_write(p)
-                os.replace(tmp_path, p)
-            finally:
-                if os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-    finally:
-        for p in reversed(acquired):
-            release_lock(p)
 
-def safe_read_csv(path: str, required_columns: list[str]) -> pd.DataFrame:
-    ensure_csv_if_missing(path, required_columns)
+def _safe_dt(s):
+    return pd.to_datetime(s, errors="coerce")
+def build_entries_view(df: pd.DataFrame, want_milk_type_col: bool = False) -> pd.DataFrame:
+    """
+    Builds a clean, UI-ready view of entries with Retailer/Category/Zone names.
+    Keeps your existing calls working (want_milk_type_col kept for compatibility).
+    """
+    if df is None or df.empty:
+        cols = ["entry_id", "date", "zone", "Retailer", "Category", "qty", "rate", "amount"]
+        return pd.DataFrame(columns=cols)
 
-    if os.path.exists(path) and os.path.getsize(path) == 0:
-        q = quarantine_corrupt_file(path)
-        pd.DataFrame(columns=required_columns).to_csv(path, index=False, encoding="utf-8-sig")
-        st.error(f"⚠️ Empty file detected and quarantined: {os.path.basename(q)}")
-        return pd.DataFrame(columns=required_columns)
+    out = df.copy()
 
-    try:
-        df = pd.read_csv(path, encoding="utf-8-sig")
-        if df is None:
-            df = pd.DataFrame(columns=required_columns)
-    except (EmptyDataError, ParserError, UnicodeDecodeError, ValueError):
-        q = quarantine_corrupt_file(path)
-        pd.DataFrame(columns=required_columns).to_csv(path, index=False, encoding="utf-8-sig")
-        st.error(f"⚠️ Corrupted file detected and quarantined: {os.path.basename(q)}")
-        return pd.DataFrame(columns=required_columns)
+    # Normalize date
+    out["date"] = _safe_dt(out["date"]).dt.strftime("%Y-%m-%d")
 
-    missing = [c for c in required_columns if c not in df.columns]
-    if missing:
-        allowed = ALLOWED_LEGACY_MISSING.get(path, set())
-        if set(missing).issubset(allowed):
-            for c in missing:
-                df[c] = pd.NA
-        else:
-            q = quarantine_corrupt_file(path)
-            pd.DataFrame(columns=required_columns).to_csv(path, index=False, encoding="utf-8-sig")
-            st.error(f"⚠️ Bad schema detected and quarantined: {os.path.basename(q)}")
-            return pd.DataFrame(columns=required_columns)
+    # Make sure IDs are numeric for joins
+    out["retailer_id"] = pd.to_numeric(out.get("retailer_id", 0), errors="coerce").fillna(0).astype(int)
+    out["category_id"] = pd.to_numeric(out.get("category_id", 0), errors="coerce").fillna(0).astype(int)
 
-    extras = [c for c in df.columns if c not in required_columns]
-    df = df[required_columns + extras].copy()
-    return df
+    # Merge retailer name + zone
+    if "retailers" in globals() and isinstance(retailers, pd.DataFrame) and not retailers.empty:
+        rmap = retailers[["retailer_id", "name", "zone"]].copy()
+        rmap["retailer_id"] = pd.to_numeric(rmap["retailer_id"], errors="coerce").fillna(0).astype(int)
+        rmap["zone"] = rmap["zone"].apply(_norm_zone)
+        out = out.merge(rmap, on="retailer_id", how="left")
+        out = out.rename(columns={"name": "Retailer"})
+    else:
+        out["Retailer"] = "-"
 
-def parse_boolish_active(x) -> bool:
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return True
-    s = str(x).strip().lower()
-    if s == "":
-        return True
-    return s in ("true", "1", "yes", "y")
+    # Merge category name
+    if "categories" in globals() and isinstance(categories, pd.DataFrame) and not categories.empty:
+        cmap = categories[["category_id", "name"]].copy()
+        cmap["category_id"] = pd.to_numeric(cmap["category_id"], errors="coerce").fillna(0).astype(int)
+        out = out.merge(cmap, on="category_id", how="left")
+        out = out.rename(columns={"name": "Category"})
+    else:
+        out["Category"] = "-"
 
-def parse_boolish_paid(x) -> bool:
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return False
-    s = str(x).strip().lower()
-    if s == "":
-        return False
-    return s in ("true", "1", "yes", "y")
+    # Clean fallbacks
+    out["Retailer"] = out.get("Retailer", "-").fillna("-").astype(str)
+    out["Category"] = out.get("Category", "-").fillna("-").astype(str)
+    out["zone"] = out.get("zone", "Default").fillna("Default").astype(str).apply(_norm_zone)
+
+    # Ensure numeric columns
+    for c in ["qty", "rate", "amount"]:
+        out[c] = pd.to_numeric(out.get(c, 0.0), errors="coerce").fillna(0.0).astype(float)
+
+    cols = ["entry_id", "date", "zone", "Retailer", "Category", "qty", "rate", "amount"]
+    # keep only what UI uses
+    for c in cols:
+        if c not in out.columns:
+            out[c] = "-" if c in ["zone", "Retailer", "Category", "date"] else 0
+
+    return out[cols]
+
 
 def _norm_zone(z: str) -> str:
-    return str(z or "Default").strip() or "Default"
+    z = "" if z is None else str(z).strip()
+    return "Default" if not z else " ".join(z.split()).title()
 
-def _safe_dt(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce")
+def parse_boolish_active(v) -> bool:
+    if v is None:
+        return True
+    s = str(v).strip().lower()
+    if s in ("false", "0", "no", "n", "inactive", "off"):
+        return False
+    if s in ("true", "1", "yes", "y", "active", "on"):
+        return True
+    try:
+        return bool(int(float(s)))
+    except Exception:
+        return True  # default active
 
-def _fmt_money(x: float) -> str:
+def parse_boolish_paid(v) -> bool:
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes", "y", "paid", "on"):
+        return True
+    if s in ("false", "0", "no", "n", "unpaid", "off"):
+        return False
+    try:
+        return bool(int(float(s)))
+    except Exception:
+        return False
+
+def next_id_from_df(df: pd.DataFrame, id_col: str) -> int:
+    if df is None or df.empty or id_col not in df.columns:
+        return 1
+    s = pd.to_numeric(df[id_col], errors="coerce").dropna()
+    return int(s.max()) + 1 if not s.empty else 1
+
+def _fmt_money(x) -> str:
     try:
         return f"₹{float(x):,.2f}"
     except Exception:
         return "₹0.00"
 
-def display_or_dash(x) -> str:
-    s = "" if x is None else str(x).strip()
-    return s if s else "–"
-
-def build_entries_view(df_entries: pd.DataFrame, want_milk_type_col: bool = False) -> pd.DataFrame:
-    if df_entries is None or df_entries.empty:
-        out = df_entries.copy() if df_entries is not None else pd.DataFrame()
-        for c in ["Retailer", "Category", "Milk Type", "zone"]:
-            if c not in out.columns:
-                out[c] = pd.Series(dtype="object")
-        return out
-
-    out = df_entries.copy()
-
-    rmap = retailers[["retailer_id", "name", "zone"]].copy() if not retailers.empty else pd.DataFrame(columns=["retailer_id", "name", "zone"])
-    out = out.merge(rmap, on="retailer_id", how="left", suffixes=("", "_ret"))
-
-    if "Retailer" not in out.columns:
-        if "name" in out.columns:
-            out = out.rename(columns={"name": "Retailer"})
-        elif "name_ret" in out.columns:
-            out = out.rename(columns={"name_ret": "Retailer"})
-        else:
-            out["Retailer"] = ""
-
-    if "zone" in out.columns:
-        out["zone"] = out["zone"].apply(_norm_zone)
-    else:
-        out["zone"] = "Default"
-
-    cmap = categories[["category_id", "name"]].copy() if not categories.empty else pd.DataFrame(columns=["category_id", "name"])
-    out = out.merge(cmap, on="category_id", how="left", suffixes=("", "_cat"))
-
-    if "name_cat" in out.columns:
-        out = out.rename(columns={"name_cat": "Category"})
-    elif "name" in out.columns and "Category" not in out.columns:
-        out = out.rename(columns={"name": "Category"})
-    else:
-        if "Category" not in out.columns:
-            out["Category"] = ""
-
-    if want_milk_type_col:
-        out["Milk Type"] = out["Category"]
-
-    return out
-
+def display_or_dash(v, dash="–") -> str:
+    s = "" if v is None else str(v).strip()
+    return dash if not s else s
 
 def df_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    # safest for Streamlit/Arrow: convert everything to string for display tables that may mix "-" and numbers
-    for c in out.columns:
-        out[c] = out[c].apply(lambda v: "–" if _is_missingish(v) else str(v))
+    if df is None:
+        return pd.DataFrame()
+    return df.replace({None: "–"}).fillna("–")
+
+def sb_fetch_all(table: str, cols="*", page_size: int = 1000, max_retries: int = 5):
+    out = []
+    offset = 0
+
+    while True:
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = sb.table(table).select(cols).range(offset, offset + page_size - 1).execute()
+                batch = resp.data or []
+                out.extend(batch)
+
+                if len(batch) < page_size:
+                    return out
+
+                offset += page_size
+                last_exc = None
+                break  # success, exit retry loop
+
+            except Exception as e:
+                last_exc = e
+                time.sleep(0.3 * attempt)  # small backoff
+
+        if last_exc is not None:
+            raise last_exc
+
+
+
+def _normalize_df_from_rows(path: str, columns: list[str], rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        df = pd.DataFrame(columns=columns)
+    else:
+        df = pd.DataFrame(rows)
+
+    # Ensure schema columns exist (create missing as blank/None)
+    for c in columns:
+        if c not in df.columns:
+            df[c] = None
+
+    # Allow legacy missing columns without crashing
+    legacy_ok = ALLOWED_LEGACY_MISSING.get(path, set())
+    for c in legacy_ok:
+        if c not in df.columns:
+            df[c] = None
+
+    # Keep only schema columns (and legacy allowed ones if they are in schema)
+    keep = [c for c in columns if c in df.columns]
+    return df[keep].copy()
+
+
+def sb_fetch_where(table: str, cols: str = "*", filters: list[tuple] | None = None, page_size: int = 1000, in_chunk: int = 500) -> list[dict]:
+    """
+    Fetch rows from Supabase table with server-side filters.
+    Supported ops: eq, lt, lte, gt, gte, in
+    """
+    filters = filters or []
+    base = sb.table(table).select(cols)
+
+    in_filters = []
+    for col, op, val in filters:
+        if op == "in":
+            vals = list(val) if isinstance(val, (list, tuple, set)) else [val]
+            in_filters.append((col, vals))
+        elif op == "eq":
+            base = base.eq(col, val)
+        elif op == "lt":
+            base = base.lt(col, val)
+        elif op == "lte":
+            base = base.lte(col, val)
+        elif op == "gt":
+            base = base.gt(col, val)
+        elif op == "gte":
+            base = base.gte(col, val)
+        else:
+            raise ValueError(f"Unsupported op: {op}")
+
+    def _fetch(q):
+        out = []
+        offset = 0
+        while True:
+            resp = q.range(offset, offset + page_size - 1).execute()
+            batch = resp.data or []
+            out.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        return out
+
+    if not in_filters:
+        return _fetch(base)
+
+    first_col, first_vals = in_filters[0]
+    rest_in = in_filters[1:]
+
+    out = []
+    for i in range(0, len(first_vals), in_chunk):
+        q = base.in_(first_col, first_vals[i:i + in_chunk])
+        for col, vals in rest_in:
+            q = q.in_(col, vals)
+        out.extend(_fetch(q))
     return out
 
-def next_id_from_df(df: pd.DataFrame, col: str) -> int:
-    if df is None or df.empty or col not in df.columns:
-        return 1
-    m = pd.to_numeric(df[col], errors="coerce").max()
-    if pd.isna(m):
-        return 1
-    return int(m) + 1
 
+def sb_fetch_df(path: str, columns: list[str], filters: list[tuple] | None = None) -> pd.DataFrame:
+    if not filters:
+        return safe_read_csv(path, columns)
+    if path not in FILE_TO_TABLE:
+        return pd.DataFrame(columns=columns)
+    table, _ = FILE_TO_TABLE[path]
+    try:
+        rows = sb_fetch_where(table, cols="*", filters=filters)
+        return _normalize_df_from_rows(path, columns, rows)
+    except Exception:
+        return safe_read_csv(path, columns)
+
+
+def _prepare_df_for_write(df: pd.DataFrame, path: str) -> pd.DataFrame:
+    df = df.copy() if df is not None else pd.DataFrame()
+    expected_cols = CSV_SCHEMAS.get(path, [])
+    if not expected_cols:
+        table, _ = FILE_TO_TABLE[path]
+        raise RuntimeError(f"{table}: missing schema definition for {path}")
+
+    # Drop any unexpected columns to avoid Supabase "column does not exist" errors.
+    extra_cols = [c for c in df.columns if c not in expected_cols]
+    if extra_cols:
+        df = df.drop(columns=extra_cols, errors="ignore")
+
+    # Ensure all expected columns exist (missing columns become NULLs).
+    for c in expected_cols:
+        if c not in df.columns:
+            df[c] = None
+
+    # Keep stable column order to match schema.
+    return df[expected_cols]
+
+
+def sb_insert_df(df: pd.DataFrame, path: str) -> None:
+        # Allow passing a dict/list by mistake (common from UI code)
+    if isinstance(df, dict):
+        df = pd.DataFrame([df])
+    elif isinstance(df, list):
+        df = pd.DataFrame(df)
+
+    if path not in FILE_TO_TABLE:
+        raise ValueError(f"Unknown mapping for: {path}")
+    table, pk = FILE_TO_TABLE[path]
+
+    df = _prepare_df_for_write(df, path)
+    if df.empty:
+        return
+
+    if USE_DB_IDS:
+        if pk not in df.columns:
+            raise RuntimeError(f"{table}: missing primary key column '{pk}' in dataframe")
+        if df[pk].isna().all():
+            payload = df.drop(columns=[pk], errors="ignore")
+            records = payload.where(pd.notna(payload), None).to_dict(orient="records")
+            chunk = 500
+            for i in range(0, len(records), chunk):
+                sb.table(table).insert(records[i:i+chunk]).execute()
+            return
+        if df[pk].isna().any():
+            raise RuntimeError(f"{table}: mixed NULL/non-NULL primary keys with use_db_ids enabled")
+
+    safe_write_csv(df, path, allow_empty=False)
+def sb_delete_by_pk(table: str, pk: str, ids: list[int], chunk: int = 500) -> None:
+    ids = [int(x) for x in ids if x is not None]
+    if not ids:
+        return
+    for i in range(0, len(ids), chunk):
+        sb.table(table).delete().in_(pk, ids[i:i+chunk]).execute()
+
+
+
+def sb_delete_where(table: str, filters: list[tuple], in_chunk: int = 500) -> None:
+    """
+    FIXED: preserves ALL filters even when using IN().
+    filters: list of tuples like:
+      ("date","eq","2026-02-05")
+      ("retailer_id","in",[1,2,3])
+    Supported ops: eq, lt, lte, gt, gte, in
+    """
+    base = sb.table(table).delete()
+
+    in_filters = []
+    for col, op, val in filters:
+        if op == "in":
+            vals = list(val) if isinstance(val, (list, tuple, set)) else [val]
+            in_filters.append((col, vals))
+        elif op == "eq":
+            base = base.eq(col, val)
+        elif op == "lt":
+            base = base.lt(col, val)
+        elif op == "lte":
+            base = base.lte(col, val)
+        elif op == "gt":
+            base = base.gt(col, val)
+        elif op == "gte":
+            base = base.gte(col, val)
+        else:
+            raise ValueError(f"Unsupported op: {op}")
+
+    if not in_filters:
+        base.execute()
+        return
+
+    first_col, first_vals = in_filters[0]
+    rest_in = in_filters[1:]
+
+    for i in range(0, len(first_vals), in_chunk):
+        q = base.in_(first_col, first_vals[i:i + in_chunk])
+        for col, vals in rest_in:
+            q = q.in_(col, vals)
+        q.execute()
+
+def safe_write_csv(df: pd.DataFrame, path: str, allow_empty: bool = False) -> None:
+    """
+    DB MODE:
+    - Upsert rows only (NO implicit deletes).
+    - Deletions must be explicit via sb_delete_* helpers.
+    """
+    if path not in FILE_TO_TABLE:
+        raise ValueError(f"Unknown mapping for: {path}")
+
+    table, pk = FILE_TO_TABLE[path]
+    df = _prepare_df_for_write(df, path)
+
+    if df.empty and not allow_empty:
+        raise RuntimeError(
+            f"Refusing to write EMPTY dataframe to {table}. "
+            f"Pass allow_empty=True only if you truly want to write nothing."
+        )
+    if df.empty:
+        return
+
+    # Option B: DB-generated primary keys
+    if pk in df.columns and df[pk].isna().all():
+        df = df.drop(columns=[pk])
+        
+    elif pk in df.columns and df[pk].isna().any():
+        raise RuntimeError(f"{table}: mixed NULL/non-NULL primary keys")
+
+    
+    if df[pk].duplicated().any():
+        dups = df[df[pk].duplicated(keep=False)][pk].tolist()[:10]
+        raise RuntimeError(f"{table}: duplicate primary keys in dataframe (sample): {dups}")
+
+    records = df.where(pd.notna(df), None).to_dict(orient="records")
+    chunk = 500
+    for i in range(0, len(records), chunk):
+        sb.table(table).upsert(records[i:i+chunk], on_conflict=pk).execute()
+
+def safe_write_two_csvs(df1: pd.DataFrame, path1: str, df2: pd.DataFrame, path2: str) -> None:
+    safe_write_csv(df1, path1, allow_empty=True)
+    safe_write_csv(df2, path2, allow_empty=True)
 
 # ================== DISTRIBUTOR LEDGER + BILL HELPERS ==================
+
+def safe_read_csv(path: str, columns: list[str]) -> pd.DataFrame:
+    """
+    DB MODE:
+    - Reads from Supabase tables (NOT local CSV).
+    - Returns a DataFrame with exactly the expected schema columns (plus allowed legacy missing columns).
+    """
+    if path not in FILE_TO_TABLE:
+        # fallback: return empty with the requested columns
+        return pd.DataFrame(columns=columns)
+
+    table, pk = FILE_TO_TABLE[path]
+
+    rows = sb_fetch_all(table, cols="*")
+    if not rows:
+        df = pd.DataFrame(columns=columns)
+    else:
+        df = pd.DataFrame(rows)
+
+    # Ensure schema columns exist (create missing as blank/None)
+    for c in columns:
+        if c not in df.columns:
+            df[c] = None
+
+    # Allow legacy missing columns without crashing
+    legacy_ok = ALLOWED_LEGACY_MISSING.get(path, set())
+    for c in legacy_ok:
+        if c not in df.columns:
+            df[c] = None
+
+    # Keep only schema columns (and legacy allowed ones if they are in schema)
+    keep = [c for c in columns if c in df.columns]
+    df = df[keep].copy()
+
+    return df
+
 
 def distributor_balance_before(distributor_id: int, start_day: date) -> float:
     """
     Due before start_day = (purchases before) - (payments before)
     Positive => you owe distributor.
     """
-    dp = dist_purchases.copy()
-    pay = dist_payments.copy()
+    if USE_SERVER_FILTERS:
+        dp = sb_fetch_df(
+            DISTRIBUTOR_PURCHASES_FILE,
+            CSV_SCHEMAS[DISTRIBUTOR_PURCHASES_FILE],
+            filters=[
+                ("distributor_id", "eq", int(distributor_id)),
+                ("date", "lt", str(start_day)),
+            ],
+        )
+        pay = sb_fetch_df(
+            DISTRIBUTOR_PAYMENTS_FILE,
+            CSV_SCHEMAS[DISTRIBUTOR_PAYMENTS_FILE],
+            filters=[
+                ("distributor_id", "eq", int(distributor_id)),
+                ("date", "lt", str(start_day)),
+            ],
+        )
+    else:
+        dp = dist_purchases.copy()
+        pay = dist_payments.copy()
 
     purchases_amt = 0.0
     paid_amt = 0.0
@@ -525,7 +725,18 @@ def build_distributor_daily_grid(distributor_id: int, start_day: date, end_day: 
     """
     days = pd.date_range(start=start_day, end=end_day, freq="D").date
 
-    dp = dist_purchases.copy()
+    if USE_SERVER_FILTERS:
+        dp = sb_fetch_df(
+            DISTRIBUTOR_PURCHASES_FILE,
+            CSV_SCHEMAS[DISTRIBUTOR_PURCHASES_FILE],
+            filters=[
+                ("distributor_id", "eq", int(distributor_id)),
+                ("date", "gte", str(start_day)),
+                ("date", "lte", str(end_day)),
+            ],
+        )
+    else:
+        dp = dist_purchases.copy()
     if not dp.empty:
         dp["date"] = _safe_dt(dp["date"]).dt.date
         dp = dp.loc[
@@ -543,7 +754,18 @@ def build_distributor_daily_grid(distributor_id: int, start_day: date, end_day: 
         dp = dp.merge(categories[["category_id", "name"]], on="category_id", how="left").rename(columns={"name": "Category"})
         dp["Category"] = dp["Category"].fillna("").astype(str)
 
-    pay = dist_payments.copy()
+    if USE_SERVER_FILTERS:
+        pay = sb_fetch_df(
+            DISTRIBUTOR_PAYMENTS_FILE,
+            CSV_SCHEMAS[DISTRIBUTOR_PAYMENTS_FILE],
+            filters=[
+                ("distributor_id", "eq", int(distributor_id)),
+                ("date", "gte", str(start_day)),
+                ("date", "lte", str(end_day)),
+            ],
+        )
+    else:
+        pay = dist_payments.copy()
     if not pay.empty:
         pay["date"] = _safe_dt(pay["date"]).dt.date
         pay = pay.loc[
@@ -1168,8 +1390,26 @@ def zone_category_pivot_for_day(day: date) -> pd.DataFrame:
 
 # ================== BILL / STATEMENT HELPERS ==================
 def retailer_balance_before(retailer_id: int, start_day: date) -> float:
-    e = entries.copy()
-    p = payments.copy()
+    if USE_SERVER_FILTERS:
+        e = sb_fetch_df(
+            ENTRIES_FILE,
+            CSV_SCHEMAS[ENTRIES_FILE],
+            filters=[
+                ("retailer_id", "eq", int(retailer_id)),
+                ("date", "lt", str(start_day)),
+            ],
+        )
+        p = sb_fetch_df(
+            PAYMENTS_FILE,
+            CSV_SCHEMAS[PAYMENTS_FILE],
+            filters=[
+                ("retailer_id", "eq", int(retailer_id)),
+                ("date", "lt", str(start_day)),
+            ],
+        )
+    else:
+        e = entries.copy()
+        p = payments.copy()
     sales = 0.0
     paid = 0.0
 
@@ -1210,7 +1450,18 @@ def build_bill_daily_grid(retailer_id: int, start_day: date, end_day: date, cat_
     """
     days = pd.date_range(start=start_day, end=end_day, freq="D").date
 
-    e = entries.copy()
+    if USE_SERVER_FILTERS:
+        e = sb_fetch_df(
+            ENTRIES_FILE,
+            CSV_SCHEMAS[ENTRIES_FILE],
+            filters=[
+                ("retailer_id", "eq", int(retailer_id)),
+                ("date", "gte", str(start_day)),
+                ("date", "lte", str(end_day)),
+            ],
+        )
+    else:
+        e = entries.copy()
     if not e.empty:
         e["date"] = _safe_dt(e["date"]).dt.date
         e = e.loc[
@@ -1223,7 +1474,18 @@ def build_bill_daily_grid(retailer_id: int, start_day: date, end_day: date, cat_
         e = e.merge(categories[["category_id", "name"]], on="category_id", how="left").rename(columns={"name": "Category"})
         e["Category"] = e["Category"].fillna("").astype(str)
 
-    p = payments.copy()
+    if USE_SERVER_FILTERS:
+        p = sb_fetch_df(
+            PAYMENTS_FILE,
+            CSV_SCHEMAS[PAYMENTS_FILE],
+            filters=[
+                ("retailer_id", "eq", int(retailer_id)),
+                ("date", "gte", str(start_day)),
+                ("date", "lte", str(end_day)),
+            ],
+        )
+    else:
+        p = payments.copy()
     if not p.empty:
         p["date"] = _safe_dt(p["date"]).dt.date
         p = p.loc[
@@ -1678,7 +1940,7 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
 
     grid_df, cat_list = build_daily_posting_grid(posting_date, posting_zone, retailers_active, categories_active)
     if grid_df.empty:
-        st.warning("No retailers found for selected zone (check retailers.csv zone values).")
+        st.warning("No retailers found for selected zone (check retailer zone values).")
         st.stop()
 
     st.caption("Edit liters + today's payment. Saving overwrites ONLY this date + zone retailers.")
@@ -1722,7 +1984,15 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
 
     view = preview.copy()
     for c in cat_list:
-        view[c] = view[c].apply(lambda x: "–" if float(x or 0.0) == 0.0 else f"{float(x):.2f}")
+        def fmt_money(x):
+            try:
+                v = float(x)
+                return "–" if v == 0 else f"{v:.2f}"
+            except Exception:
+                return "–"
+                
+        view[c] = view[c].apply(fmt_money)
+
 
     st.subheader("📌 Preview")
     st.dataframe(df_for_display(view), use_container_width=True)
@@ -1749,23 +2019,16 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
         affected_rids = set(rz["retailer_id"].astype(int).tolist())
 
         if not affected_rids:
-            st.error("No retailers found for selected zone. Fix zones in retailers.csv.")
+            st.error("No retailers found for selected zone. Fix retailer zones.")
             st.stop()
 
-        e = entries.copy()
-        p = payments.copy()
-        if not e.empty:
-            e["date"] = pd.to_datetime(e["date"], errors="coerce").dt.date
-        if not p.empty:
-            p["date"] = pd.to_datetime(p["date"], errors="coerce").dt.date
+        # ✅ DB overwrite: explicitly delete existing rows for this date + affected retailers
+        sb_delete_where("entries", [("date", "eq", str(posting_date)), ("retailer_id", "in", list(affected_rids))])
+        sb_delete_where("payments", [("date", "eq", str(posting_date)), ("retailer_id", "in", list(affected_rids))])
 
-        if not e.empty:
-            e = e.loc[~((e["date"] == posting_date) & (e["retailer_id"].astype(int).isin(affected_rids)))].copy()
-        if not p.empty:
-            p = p.loc[~((p["date"] == posting_date) & (p["retailer_id"].astype(int).isin(affected_rids)))].copy()
 
-        next_entry_id = next_id_from_df(e, "entry_id")
-        next_pay_id = next_id_from_df(p, "payment_id")
+        next_entry_id = None if USE_DB_IDS else sb_next_id("entries", "entry_id")
+        next_pay_id = None if USE_DB_IDS else sb_next_id("payments", "payment_id")
 
 
         new_entries = []
@@ -1783,24 +2046,28 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
                 cid = int(categories_active.loc[categories_active["name"] == cat_name, "category_id"].iloc[0])
                 rate = float(get_price_for_date(rid, cid, posting_date))
                 amount = qty * rate
-                eid = next_entry_id
-                next_entry_id += 1
+                eid = None if next_entry_id is None else next_entry_id
+                if next_entry_id is not None:
+                    next_entry_id += 1
                 new_entries.append([eid, str(posting_date), rid, cid, float(qty), float(rate), float(amount)])
 
             pay_amt = float(row.get("Today Payment ₹", 0.0) or 0.0)
             if pay_amt > 0:
                 mode = str(row.get("Mode", "Cash") or "Cash")
-                pid = next_pay_id
-                next_pay_id += 1
+                pid = None if next_pay_id is None else next_pay_id
+                if next_pay_id is not None:
+                    next_pay_id += 1
                 new_payments.append([pid, str(posting_date), rid, float(pay_amt), mode, "Daily Posting Sheet"])
 
 
         if new_entries:
-            e = pd.concat([e, pd.DataFrame(new_entries, columns=CSV_SCHEMAS[ENTRIES_FILE])], ignore_index=True)
+            new_e = pd.DataFrame(new_entries, columns=CSV_SCHEMAS[ENTRIES_FILE])
+            sb_insert_df(new_e, ENTRIES_FILE)
+        
         if new_payments:
-            p = pd.concat([p, pd.DataFrame(new_payments, columns=CSV_SCHEMAS[PAYMENTS_FILE])], ignore_index=True)
-
-        safe_write_two_csvs(e, ENTRIES_FILE, p, PAYMENTS_FILE)
+            new_p = pd.DataFrame(new_payments, columns=CSV_SCHEMAS[PAYMENTS_FILE])
+            sb_insert_df(new_p, PAYMENTS_FILE)
+        
         st.success("✅ Saved. Data will reflect in Date+Zone View and Zone-wise Summary.")
         st.rerun()
 
@@ -1964,7 +2231,10 @@ elif menu == "✏️ Edit (Single Entry)":
             rate = float(row["rate"])
             new_amt = float(new_qty) * rate
             entries.loc[entries["entry_id"] == int(entry_id), ["qty", "amount"]] = [float(new_qty), float(new_amt)]
-            safe_write_csv(entries, ENTRIES_FILE)
+            # DB write only the changed row
+            updated_row = entries.loc[entries["entry_id"] == int(entry_id)].copy()
+            safe_write_csv(updated_row, ENTRIES_FILE, allow_empty=False)
+            
             st.success("Updated quantity (stored rate preserved).")
             st.rerun()
 
@@ -1974,10 +2244,12 @@ elif menu == "✏️ Edit (Single Entry)":
             if confirm != "DELETE":
                 st.warning("Type DELETE to confirm.")
             else:
-                entries2 = entries.loc[entries["entry_id"] != int(entry_id)].copy()
-                safe_write_csv(entries2, ENTRIES_FILE)
+                sb_delete_by_pk("entries", "entry_id", [int(entry_id)])
+                entries = entries.loc[entries["entry_id"].astype(int) != int(entry_id)].copy()
                 st.success("Deleted.")
                 st.rerun()
+
+
 
 # ================== MILK CATEGORIES ==================
 elif menu == "🥛 Milk Categories":
@@ -1994,13 +2266,32 @@ elif menu == "🥛 Milk Categories":
             default_price = st.number_input("Default Price per Liter (₹)", min_value=0.0, step=0.5, format="%g", key="cat_add_price")
 
         if st.button("Add Category", type="primary", key="cat_add_btn"):
-            if name.strip():
-                cid = next_id_from_df(categories, "category_id")
-                new_row = pd.DataFrame([[cid, name.strip(), description, float(default_price), True]], columns=CSV_SCHEMAS[CATEGORIES_FILE])
-                categories = pd.concat([categories, new_row], ignore_index=True)
-                safe_write_csv(categories, CATEGORIES_FILE)
-                st.success(f"✅ Category '{name}' added.")
-                st.rerun()
+            if not name.strip():
+                st.error("Category name is required.")
+                st.stop()
+                
+            if default_price <= 0:
+                st.error("Default price must be greater than 0.")
+                st.stop()
+                
+            # OPTION B: DB auto-generates category_id
+            table, pk = FILE_TO_TABLE[CATEGORIES_FILE]
+            
+            new_row = pd.DataFrame([{
+                "category_id": sb_new_id(table, pk),   # ✅ THIS IS THE FIX
+                "name": name.strip(),
+                "description": description.strip() if description else "",
+                "default_price": float(default_price),
+                "is_active": True,
+            }])
+            
+            sb_insert_df(new_row, CATEGORIES_FILE)
+
+            st.success("Category added.")
+            st.rerun()
+
+
+
 
     with tab2:
         if categories.empty:
@@ -2030,26 +2321,36 @@ elif menu == "🥛 Milk Categories":
                 new_active = st.checkbox("Active", value=bool(cat_data.get("is_active", True)), key="cat_new_active")
 
             colA, colB, colC = st.columns(3)
+            
+            
             with colA:
                 if st.button("Update Category", key="cat_update_btn"):
-                    mask = categories["category_id"] == cid
+                    mask = categories["category_id"].astype(int) == int(cid)
+                    
                     categories.loc[mask, ["name", "description", "default_price", "is_active"]] = [
                         new_name.strip(),
                         new_desc,
                         float(new_default_price),
                         bool(new_active),
                     ]
-                    safe_write_csv(categories, CATEGORIES_FILE)
+                    updated_row = categories.loc[mask].copy()
+                    safe_write_csv(updated_row, CATEGORIES_FILE, allow_empty=False)
+                    
                     st.success("Updated!")
                     st.rerun()
 
+
             with colB:
                 if st.button("Deactivate Category (Safe)", key="cat_deactivate_btn"):
-                    mask = categories["category_id"] == cid
+                    mask = categories["category_id"].astype(int) == int(cid)
                     categories.loc[mask, "is_active"] = False
-                    safe_write_csv(categories, CATEGORIES_FILE)
+                    
+                    updated_row = categories.loc[mask].copy()
+                    safe_write_csv(updated_row, CATEGORIES_FILE, allow_empty=False)
+                    
                     st.success("Category deactivated (history preserved).")
                     st.rerun()
+
 
             with colC:
                 st.caption("Hard delete is blocked if referenced.")
@@ -2060,8 +2361,7 @@ elif menu == "🥛 Milk Categories":
                     elif is_category_referenced(cid):
                         st.error("Blocked: Category is referenced in history. Deactivate instead.")
                     else:
-                        categories = categories.loc[categories["category_id"] != cid].copy()
-                        safe_write_csv(categories, CATEGORIES_FILE)
+                        sb_delete_by_pk("categories", "category_id", [cid])
                         st.success("Hard deleted.")
                         st.rerun()
 
@@ -2091,10 +2391,9 @@ elif menu == "🏪 Retailers":
                 st.warning("Retailer name required")
             else:
                 z = _norm_zone(zone)
-                rid = next_id_from_df(retailers, "retailer_id")
+                rid = sb_new_id("retailers", "retailer_id")
                 new_row = pd.DataFrame([[rid, name.strip(), contact, address, z, True]], columns=CSV_SCHEMAS[RETAILERS_FILE])
-                retailers = pd.concat([retailers, new_row], ignore_index=True)
-                safe_write_csv(retailers, RETAILERS_FILE)
+                sb_insert_df(new_row, RETAILERS_FILE)
                 st.success(f"✅ Retailer '{name}' added to zone '{z}'!")
                 st.rerun()
 
@@ -2127,10 +2426,13 @@ elif menu == "🏪 Retailers":
                 new_active = st.checkbox("Active", value=bool(ret_data.get("is_active", True)), key="ret_new_active")
 
             colA, colB, colC = st.columns(3)
+            
+            
             with colA:
                 if st.button("Update Retailer", key="ret_update_btn"):
                     z = _norm_zone(new_zone)
-                    mask = retailers["retailer_id"] == rid
+                    mask = retailers["retailer_id"].astype(int) == int(rid)
+                    
                     retailers.loc[mask, ["name", "contact", "address", "zone", "is_active"]] = [
                         new_name.strip(),
                         new_contact,
@@ -2138,17 +2440,25 @@ elif menu == "🏪 Retailers":
                         z,
                         bool(new_active),
                     ]
-                    safe_write_csv(retailers, RETAILERS_FILE)
+                    
+                    updated_row = retailers.loc[mask].copy()
+                    safe_write_csv(updated_row, RETAILERS_FILE, allow_empty=False)
+                    
                     st.success("Updated!")
                     st.rerun()
 
+
             with colB:
                 if st.button("Deactivate Retailer (Safe)", key="ret_deactivate_btn"):
-                    mask = retailers["retailer_id"] == rid
+                    mask = retailers["retailer_id"].astype(int) == int(rid)
                     retailers.loc[mask, "is_active"] = False
-                    safe_write_csv(retailers, RETAILERS_FILE)
+                    
+                    updated_row = retailers.loc[mask].copy()
+                    safe_write_csv(updated_row, RETAILERS_FILE, allow_empty=False)
+                    
                     st.success("Retailer deactivated (history preserved).")
                     st.rerun()
+
 
             with colC:
                 st.caption("Hard delete is blocked if referenced.")
@@ -2159,8 +2469,7 @@ elif menu == "🏪 Retailers":
                     elif is_retailer_referenced(rid):
                         st.error("Blocked: Retailer is referenced in history. Deactivate instead.")
                     else:
-                        retailers = retailers.loc[retailers["retailer_id"] != rid].copy()
-                        safe_write_csv(retailers, RETAILERS_FILE)
+                        sb_delete_by_pk("retailers", "retailer_id", [rid])
                         st.success("Hard deleted.")
                         st.rerun()
 
@@ -2210,10 +2519,9 @@ elif menu == "💰 Price Management":
                 else:
                     target_retailer_id = GLOBAL_RETAILER_ID
 
-                pid = next_id_from_df(prices, "price_id")
+                pid = sb_new_id("prices", "price_id")
                 new_row = pd.DataFrame([[pid, int(target_retailer_id), int(cid), float(price_val), str(effective_date)]], columns=CSV_SCHEMAS[PRICES_FILE])
-                prices = pd.concat([prices, new_row], ignore_index=True)
-                safe_write_csv(prices, PRICES_FILE)
+                sb_insert_df(new_row, PRICES_FILE)
                 st.success("✅ Price saved. New entries on/after effective date will use it.")
                 st.rerun()
 
@@ -2355,13 +2663,13 @@ elif menu == "🚚 Distributors":
             if not name.strip():
                 st.warning("Distributor name required.")
             else:
-                did = next_id_from_df(distributors, "distributor_id")
+                did = sb_new_id("distributors", "distributor_id")
                 new_row = pd.DataFrame(
                     [[did, name.strip(), contact.strip(), address.strip(), True]],
                     columns=CSV_SCHEMAS[DISTRIBUTORS_FILE]
                 )
                 distributors = pd.concat([distributors, new_row], ignore_index=True)
-                safe_write_csv(distributors, DISTRIBUTORS_FILE)
+                sb_insert_df(new_row, DISTRIBUTORS_FILE)
                 st.success("✅ Distributor added!")
                 st.rerun()
 
@@ -2386,26 +2694,35 @@ elif menu == "🚚 Distributors":
             new_address = st.text_area("Address", value=str(dis_data.get("address", "")), key="dist_new_address")
 
             colA, colB, colC = st.columns(3)
+            
             with colA:
                 if st.button("Update Distributor", key="dist_update_btn"):
-                    mask = distributors["distributor_id"].astype(int) == did
+                    mask = distributors["distributor_id"].astype(int) == int(did)
                     distributors.loc[mask, ["name", "contact", "address", "is_active"]] = [
                         new_name.strip(),
                         new_contact.strip(),
                         new_address.strip(),
                         bool(new_active),
                     ]
-                    safe_write_csv(distributors, DISTRIBUTORS_FILE)
+                    
+                    updated_row = distributors.loc[mask].copy()
+                    safe_write_csv(updated_row, DISTRIBUTORS_FILE, allow_empty=False)
+                    
                     st.success("Updated!")
                     st.rerun()
 
             with colB:
                 if st.button("Deactivate (Safe)", key="dist_deactivate_btn"):
-                    mask = distributors["distributor_id"].astype(int) == did
+                    mask = distributors["distributor_id"].astype(int) == int(did)
                     distributors.loc[mask, "is_active"] = False
-                    safe_write_csv(distributors, DISTRIBUTORS_FILE)
+
+                    updated_row = distributors.loc[mask].copy()
+                    safe_write_csv(updated_row, DISTRIBUTORS_FILE, allow_empty=False)
+
                     st.success("Distributor deactivated.")
                     st.rerun()
+
+
 
             with colC:
                 confirm = st.text_input("Type DELETE to hard delete", key="dist_delete_confirm")
@@ -2415,8 +2732,7 @@ elif menu == "🚚 Distributors":
                     elif is_distributor_referenced(did):
                         st.error("Blocked: Distributor referenced in purchases/payments. Deactivate instead.")
                     else:
-                        distributors = distributors.loc[distributors["distributor_id"].astype(int) != did].copy()
-                        safe_write_csv(distributors, DISTRIBUTORS_FILE)
+                        sb_delete_by_pk("distributors", "distributor_id", [did])
                         st.success("Hard deleted.")
                         st.rerun()
 
@@ -2476,20 +2792,27 @@ elif menu == "📦 Milk Purchases":
         amount = float(qty) * float(rate)
         st.info(f"Amount = ₹{amount:.2f}")
 
+        # ================== FIX 1: DISTRIBUTOR PURCHASE SAVE (REPLACE THE WHOLE SAVE BUTTON BLOCK) ==================
         if st.button("Save Purchase", type="primary", key="pur_save"):
             if qty <= 0 or rate <= 0:
                 st.error("Qty and Rate must be > 0.")
                 st.stop()
-
-            pid = next_id_from_df(dist_purchases, "purchase_id")
+                # Supabase-safe ID
+            pid = sb_new_id("distributor_purchases", "purchase_id")
+            
             new_row = pd.DataFrame(
                 [[pid, str(p_date), did, cid, float(qty), float(rate), float(amount)]],
                 columns=CSV_SCHEMAS[DISTRIBUTOR_PURCHASES_FILE],
             )
+            
+            #keep UI dataframe in sync
             dist_purchases = pd.concat([dist_purchases, new_row], ignore_index=True)
-            safe_write_csv(dist_purchases, DISTRIBUTOR_PURCHASES_FILE)
+            # IMPORTANT: write ONLY the new row to Supabase
+            sb_insert_df(new_row, DISTRIBUTOR_PURCHASES_FILE)
             st.success("✅ Purchase saved.")
             st.rerun()
+
+
 
     # ---------- EDIT / DELETE PURCHASE ----------
     with tab2:
@@ -2582,8 +2905,9 @@ elif menu == "📦 Milk Purchases":
                 if new_qty <= 0 or new_rate <= 0:
                     st.error("Qty and Rate must be > 0.")
                     st.stop()
-
+                
                 mask = dist_purchases["purchase_id"].astype(int) == int(selected_pid)
+                
                 dist_purchases.loc[mask, ["date", "distributor_id", "category_id", "qty", "rate", "amount"]] = [
                     str(new_date),
                     int(new_did),
@@ -2592,9 +2916,12 @@ elif menu == "📦 Milk Purchases":
                     float(new_rate),
                     float(new_amt),
                 ]
-                safe_write_csv(dist_purchases, DISTRIBUTOR_PURCHASES_FILE)
+                
+                updated = dist_purchases.loc[mask].copy()
+                safe_write_csv(updated, DISTRIBUTOR_PURCHASES_FILE, allow_empty=False)
                 st.success("Updated.")
                 st.rerun()
+
 
         with colB:
             confirm = st.text_input("Type DELETE to delete", key="pur_delete_confirm")
@@ -2602,10 +2929,10 @@ elif menu == "📦 Milk Purchases":
                 if confirm != "DELETE":
                     st.warning("Type DELETE to confirm.")
                     st.stop()
-                dist_purchases = dist_purchases.loc[dist_purchases["purchase_id"].astype(int) != int(selected_pid)].copy()
-                safe_write_csv(dist_purchases, DISTRIBUTOR_PURCHASES_FILE)
+                sb_delete_by_pk("distributor_purchases", "purchase_id", [int(selected_pid)])
                 st.success("Deleted.")
                 st.rerun()
+
 
 # ================== DISTRIBUTOR PAYMENTS ==================
 elif menu == "💸 Distributor Payments":
@@ -2635,13 +2962,12 @@ elif menu == "💸 Distributor Payments":
             if amt <= 0:
                 st.error("Amount must be > 0.")
                 st.stop()
-            pid = next_id_from_df(dist_payments, "payment_id")
+            pid = sb_new_id("distributor_payments", "payment_id")
             new_row = pd.DataFrame(
                 [[pid, str(pay_date), did, float(amt), str(mode), str(note)]],
                 columns=CSV_SCHEMAS[DISTRIBUTOR_PAYMENTS_FILE],
             )
-            dist_payments = pd.concat([dist_payments, new_row], ignore_index=True)
-            safe_write_csv(dist_payments, DISTRIBUTOR_PAYMENTS_FILE)
+            sb_insert_df(new_row, DISTRIBUTOR_PAYMENTS_FILE)
             st.success("✅ Payment saved.")
             st.rerun()
 
@@ -2693,25 +3019,33 @@ elif menu == "💸 Distributor Payments":
                         if new_amt <= 0:
                             st.error("Amount must be > 0.")
                             st.stop()
+                            
                         mask = dist_payments["payment_id"].astype(int) == int(pid)
+                        
                         dist_payments.loc[mask, ["date", "amount", "payment_mode", "note"]] = [
-                            str(new_date), float(new_amt), str(new_mode), str(new_note)
+                            str(new_date),
+                            float(new_amt),
+                            str(new_mode),
+                            str(new_note),
                         ]
-                        safe_write_csv(dist_payments, DISTRIBUTOR_PAYMENTS_FILE)
+                        
+                        updated = dist_payments.loc[mask].copy()
+                        safe_write_csv(updated, DISTRIBUTOR_PAYMENTS_FILE, allow_empty=False)
                         st.success("Updated.")
                         st.rerun()
+
+                
+                
                 with colB:
                     confirm = st.text_input("Type DELETE to delete payment", key="dpay_del_confirm")
                     if st.button("Delete Payment", key="dpay_delete"):
                         if confirm != "DELETE":
                             st.warning("Type DELETE to confirm.")
                         else:
-                            dist_payments = dist_payments.loc[
-                                dist_payments["payment_id"].astype(int) != int(pid)
-                            ].copy()
-                            safe_write_csv(dist_payments, DISTRIBUTOR_PAYMENTS_FILE)
+                            sb_delete_by_pk("distributor_payments", "payment_id", [int(pid)])
                             st.success("Deleted.")
                             st.rerun()
+
 
 
 # ================== DISTRIBUTOR LEDGER ==================
@@ -2894,19 +3228,23 @@ elif menu == "🗑️ Milk Wastage":
         reason = st.text_input("Reason", key="w_reason")
         cid = int(categories.loc[categories["name"] == cat_name, "category_id"].iloc[0])
 
+        # ================== FIX 2: MILK WASTAGE SAVE (REPLACE THE WHOLE SAVE BUTTON BLOCK) ==================
         if st.button("Save Wastage", type="primary", key="w_save"):
             if qty <= 0:
                 st.error("Qty must be > 0.")
                 st.stop()
-            wid = next_id_from_df(wastage, "wastage_id")
+                
+            wid = sb_new_id("wastage", "wastage_id")
+            
             new_row = pd.DataFrame(
-                [[wid, str(w_date), cid, float(qty), str(reason), float(est_loss)]],
+                [[wid, str(w_date), int(cid), float(qty), str(reason), float(est_loss)]],
                 columns=CSV_SCHEMAS[WASTAGE_FILE],
-            )
-            wastage = pd.concat([wastage, new_row], ignore_index=True)
-            safe_write_csv(wastage, WASTAGE_FILE)
+                )
+            
+            sb_insert_df(new_row, WASTAGE_FILE)
             st.success("✅ Wastage saved.")
             st.rerun()
+
 
     with tab2:
         if wastage.empty:
@@ -2948,22 +3286,35 @@ elif menu == "🗑️ Milk Wastage":
                             st.error("Qty must be > 0.")
                             st.stop()
                         mask = wastage["wastage_id"].astype(int) == int(wid)
+                        # ✅ update the dataframe first
+                        
                         wastage.loc[mask, ["date", "qty", "reason", "estimated_loss"]] = [
-                            str(new_date), float(new_qty), str(new_reason), float(new_loss)
+                            str(new_date),
+                            float(new_qty),
+                            str(new_reason),
+                            float(new_loss),
                         ]
-                        safe_write_csv(wastage, WASTAGE_FILE)
+                        
+                        # ✅ then write ONLY the changed row to Supabase
+                        
+                        updated = wastage.loc[mask].copy()
+                        safe_write_csv(updated, WASTAGE_FILE, allow_empty=False)
+                        
                         st.success("Updated.")
                         st.rerun()
+
+                
+                
                 with colB:
                     confirm = st.text_input("Type DELETE to delete wastage", key="w_del_confirm")
                     if st.button("Delete Wastage", key="w_delete"):
                         if confirm != "DELETE":
                             st.warning("Type DELETE to confirm.")
                         else:
-                            wastage = wastage.loc[wastage["wastage_id"].astype(int) != int(wid)].copy()
-                            safe_write_csv(wastage, WASTAGE_FILE)
+                            sb_delete_by_pk("wastage", "wastage_id", [int(wid)])
                             st.success("Deleted.")
                             st.rerun()
+
 
 
 # ================== EXPENSES ==================
@@ -2990,13 +3341,12 @@ elif menu == "💼 Expenses":
             if ex_amt <= 0:
                 st.error("Amount must be > 0.")
                 st.stop()
-            eid = next_id_from_df(expenses, "expense_id")
+            eid = sb_new_id("expenses", "expense_id")
             new_row = pd.DataFrame(
                 [[eid, str(ex_date), str(ex_cat).strip(), str(ex_desc).strip(), float(ex_amt), str(ex_mode), bool(ex_paid)]],
                 columns=CSV_SCHEMAS[EXPENSES_FILE],
             )
-            expenses = pd.concat([expenses, new_row], ignore_index=True)
-            safe_write_csv(expenses, EXPENSES_FILE)
+            sb_insert_df(new_row, EXPENSES_FILE)
             st.success("✅ Expense saved.")
             st.rerun()
 
@@ -3047,7 +3397,9 @@ elif menu == "💼 Expenses":
                         if new_amt <= 0:
                             st.error("Amount must be > 0.")
                             st.stop()
+                            
                         mask = expenses["expense_id"].astype(int) == int(eid)
+                        
                         expenses.loc[mask, ["date", "category", "description", "amount", "payment_mode", "paid"]] = [
                             str(new_date),
                             str(new_cat).strip(),
@@ -3056,9 +3408,12 @@ elif menu == "💼 Expenses":
                             str(new_mode),
                             bool(new_paid),
                         ]
-                        safe_write_csv(expenses, EXPENSES_FILE)
+                        
+                        updated = expenses.loc[mask].copy()
+                        safe_write_csv(updated, EXPENSES_FILE, allow_empty=False)
                         st.success("Updated.")
                         st.rerun()
+
 
                 with colB:
                     confirm = st.text_input("Type DELETE to delete expense", key="ex_del_confirm")
@@ -3066,8 +3421,7 @@ elif menu == "💼 Expenses":
                         if confirm != "DELETE":
                             st.warning("Type DELETE to confirm.")
                         else:
-                            expenses = expenses.loc[expenses["expense_id"].astype(int) != int(eid)].copy()
-                            safe_write_csv(expenses, EXPENSES_FILE)
+                            sb_delete_by_pk("expenses", "expense_id", [int(eid)])
                             st.success("Deleted.")
                             st.rerun()
 
@@ -3119,14 +3473,25 @@ elif menu == "🧾 Generate Bill":
     opening_due = retailer_balance_before(rid, start_day)
     closing_due = float(pd.to_numeric(grid["Running Due (₹)"], errors="coerce").fillna(opening_due).iloc[-1]) if not grid.empty else float(opening_due)
 
-    p = payments.copy()
-    if not p.empty:
-        p["date"] = _safe_dt(p["date"]).dt.date
-        p = p.loc[
-            (p["retailer_id"].astype(int) == rid)
-            & (p["date"] >= start_day)
-            & (p["date"] <= end_day)
-        ].copy()
+    if USE_SERVER_FILTERS:
+        p = sb_fetch_df(
+            PAYMENTS_FILE,
+            CSV_SCHEMAS[PAYMENTS_FILE],
+            filters=[
+                ("retailer_id", "eq", int(rid)),
+                ("date", "gte", str(start_day)),
+                ("date", "lte", str(end_day)),
+            ],
+        )
+    else:
+        p = payments.copy()
+        if not p.empty:
+            p["date"] = _safe_dt(p["date"]).dt.date
+            p = p.loc[
+                (p["retailer_id"].astype(int) == rid)
+                & (p["date"] >= start_day)
+                & (p["date"] <= end_day)
+            ].copy()
 
     if p.empty:
         pay_mode_totals = pd.DataFrame(columns=["Mode", "Total (₹)"])
@@ -3210,19 +3575,11 @@ elif menu == "🛡️ Data Health & Backup":
     st.header("🛡️ Data Health & Backup")
 
     st.subheader("Backups")
-    st.write(f"- Automatic backups are created before each write: `{BACKUP_DIR}`")
-    st.write(f"- Backups kept per file: **{BACKUPS_PER_FILE}**")
+    st.info("Backups are disabled in Supabase mode. No local CSV or ZIP backups are created.")
 
     st.subheader("Create Full Backup ZIP")
-    if st.button("📦 Create Backup ZIP Now", key="zip_now_btn"):
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for root, dirs, files in os.walk("data"):
-                for fn in files:
-                    path = os.path.join(root, fn)
-                    zf.write(path, arcname=path)
-        buf.seek(0)
-        st.download_button("⬇️ Download Backup ZIP", data=buf, file_name=f"milk_backup_{_ts()}.zip", key="zip_dl_btn")
+    st.warning("Backup ZIP is disabled in Supabase mode.")
+
 
     st.divider()
     st.subheader("Integrity Checks")
@@ -3286,3 +3643,4 @@ elif menu == "🛡️ Data Health & Backup":
             st.subheader(title)
             st.dataframe(df, width="stretch")
             st.divider()
+  

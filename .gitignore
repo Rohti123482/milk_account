@@ -16,3 +16,8 @@ data/_exports/
 # OS junk
 .DS_Store
 Thumbs.db
+
+secrets.toml
+tmp_print.py
+__pycache__/
+*.pyc
