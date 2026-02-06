@@ -176,6 +176,55 @@ if st.sidebar.button("🔌 Test DB Connection"):
         st.sidebar.error(f"Connection failed ❌\n{e}")
 
 
+
+# ================== CACHE INVALIDATION (PERFORMANCE) ==================
+def invalidate_data_cache() -> None:
+    """Bump a lightweight version key so cached DB reads don't refetch on every rerun."""
+    st.session_state["data_version"] = int(st.session_state.get("data_version", 0)) + 1
+    # Clear only our cached loader if possible; fallback to full cache clear.
+    try:
+        load_and_migrate_data_cached.clear()  # type: ignore[name-defined]
+    except Exception:
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+
+
+
+
+@st.cache_data(show_spinner=False)
+def make_full_backup_zip(data_version: int) -> bytes:
+    """Create a ZIP containing CSV exports of all core tables. Cached by data_version."""
+    _ = data_version  # cache key only
+
+    tables = {
+        "retailers": retailers,
+        "categories": categories,
+        "prices": prices,
+        "entries": entries,
+        "payments": payments,
+        "distributors": distributors,
+        "distributor_purchases": dist_purchases,
+        "distributor_payments": dist_payments,
+        "wastage": wastage,
+        "expenses": expenses,
+    }
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, df in tables.items():
+            if df is None:
+                continue
+            if not isinstance(df, pd.DataFrame):
+                continue
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            zf.writestr(f"{name}.csv", csv_bytes)
+    return buf.getvalue()
+
+def load_and_migrate_data_cached(_version: int):
+    """Cached wrapper: prevents full-table fetch on every widget interaction."""
+    return load_and_migrate_data()
 def _secret_bool(key: str, default: bool = False) -> bool:
     try:
         raw = st.secrets["supabase"].get(key, default)
@@ -312,6 +361,13 @@ def build_entries_view(df: pd.DataFrame, want_milk_type_col: bool = False) -> pd
             out[c] = "-" if c in ["zone", "Retailer", "Category", "date"] else 0
 
     return out[cols]
+
+
+@st.cache_data(show_spinner=False)
+def build_entries_view_cached(df: pd.DataFrame, data_version: int, want_milk_type_col: bool = False) -> pd.DataFrame:
+    """Cached wrapper around build_entries_view to avoid repeated merges on every rerun."""
+    _ = data_version  # cache key only
+    return build_entries_view(df, want_milk_type_col=want_milk_type_col)
 
 
 def _norm_zone(z: str) -> str:
@@ -501,13 +557,13 @@ def _prepare_df_for_write(df: pd.DataFrame, path: str) -> pd.DataFrame:
     # Keep stable column order to match schema.
     return df[expected_cols]
 
-
 def sb_insert_df(df: pd.DataFrame, path: str) -> None:
-        # Allow passing a dict/list by mistake (common from UI code)
+    # Allow passing a dict/list by mistake (common from UI code)
     if isinstance(df, dict):
         df = pd.DataFrame([df])
     elif isinstance(df, list):
         df = pd.DataFrame(df)
+
 
     if path not in FILE_TO_TABLE:
         raise ValueError(f"Unknown mapping for: {path}")
@@ -537,6 +593,8 @@ def sb_delete_by_pk(table: str, pk: str, ids: list[int], chunk: int = 500) -> No
         return
     for i in range(0, len(ids), chunk):
         sb.table(table).delete().in_(pk, ids[i:i+chunk]).execute()
+
+    invalidate_data_cache()
 
 
 
@@ -570,6 +628,7 @@ def sb_delete_where(table: str, filters: list[tuple], in_chunk: int = 500) -> No
 
     if not in_filters:
         base.execute()
+        invalidate_data_cache()
         return
 
     first_col, first_vals = in_filters[0]
@@ -580,6 +639,8 @@ def sb_delete_where(table: str, filters: list[tuple], in_chunk: int = 500) -> No
         for col, vals in rest_in:
             q = q.in_(col, vals)
         q.execute()
+
+    invalidate_data_cache()
 
 def safe_write_csv(df: pd.DataFrame, path: str, allow_empty: bool = False) -> None:
     """
@@ -601,14 +662,25 @@ def safe_write_csv(df: pd.DataFrame, path: str, allow_empty: bool = False) -> No
     if df.empty:
         return
 
-    # Option B: DB-generated primary keys
+    # If PK is entirely NULL, treat it as "DB-generated IDs": INSERT (not UPSERT).
+    # (Your caller should usually use sb_insert_df for this case, but this makes it safe.)
     if pk in df.columns and df[pk].isna().all():
-        df = df.drop(columns=[pk])
-        
-    elif pk in df.columns and df[pk].isna().any():
+        payload = df.drop(columns=[pk], errors="ignore")
+        records = payload.where(pd.notna(payload), None).to_dict(orient="records")
+        chunk = 500
+        for i in range(0, len(records), chunk):
+            sb.table(table).insert(records[i:i+chunk]).execute()
+        invalidate_data_cache()
+        return
+
+    # Mixed NULL/non-NULL PK is dangerous (can create duplicates).
+    if pk in df.columns and df[pk].isna().any():
         raise RuntimeError(f"{table}: mixed NULL/non-NULL primary keys")
 
-    
+    # Defensive: PK must exist for UPSERT
+    if pk not in df.columns:
+        raise RuntimeError(f"{table}: missing primary key column '{pk}' for upsert")
+
     if df[pk].duplicated().any():
         dups = df[df[pk].duplicated(keep=False)][pk].tolist()[:10]
         raise RuntimeError(f"{table}: duplicate primary keys in dataframe (sample): {dups}")
@@ -617,6 +689,9 @@ def safe_write_csv(df: pd.DataFrame, path: str, allow_empty: bool = False) -> No
     chunk = 500
     for i in range(0, len(records), chunk):
         sb.table(table).upsert(records[i:i+chunk], on_conflict=pk).execute()
+
+    invalidate_data_cache()
+
 
 def safe_write_two_csvs(df1: pd.DataFrame, path1: str, df2: pd.DataFrame, path2: str) -> None:
     safe_write_csv(df1, path1, allow_empty=True)
@@ -1153,7 +1228,8 @@ def load_and_migrate_data():
     return retailers, categories, prices, entries, payments, distributors, dist_purchases, dist_payments, wastage, expenses
 
 
-retailers, categories, prices, entries, payments, distributors, dist_purchases, dist_payments, wastage, expenses = load_and_migrate_data()
+st.session_state.setdefault("data_version", 0)
+retailers, categories, prices, entries, payments, distributors, dist_purchases, dist_payments, wastage, expenses = load_and_migrate_data_cached(st.session_state["data_version"])
 # ================== ZONE HELPERS ==================
 def get_all_zones() -> list[str]:
     if retailers.empty:
@@ -1301,7 +1377,7 @@ def build_daily_posting_grid(day: date, zone: str, retailers_active: pd.DataFram
     day_e = _day_entries_for_zone(day, zone)
     pivot_qty = pd.DataFrame()
     if not day_e.empty:
-        e_view = build_entries_view(day_e, want_milk_type_col=False)
+        e_view = build_entries_view_cached(day_e, st.session_state["data_version"], want_milk_type_col=False)
         pivot_qty = pd.pivot_table(
             e_view,
             index="Retailer",
@@ -1870,12 +1946,12 @@ if menu == "📊 Dashboard":
             zone_df.style.format(
                 {"Milk Sold (L)": "{:.2f}", "Sales (₹)": "₹{:.2f}", "Paid (₹)": "₹{:.2f}", "Outstanding (₹)": "₹{:.2f}"}
             ),
-            use_container_width=True,
+            width="stretch",
         )
         if not zone_df.empty:
             fig = px.bar(zone_df, x="Zone", y="Sales (₹)")
             fig.update_layout(height=350)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     st.divider()
     st.subheader("📅 Daily Business Overview")
@@ -1947,7 +2023,7 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
 
     edited = st.data_editor(
         grid_df,
-        use_container_width=True,
+        width="stretch",
         num_rows="fixed",
         key="daily_sheet_editor",
     )
@@ -1995,7 +2071,7 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
 
 
     st.subheader("📌 Preview")
-    st.dataframe(df_for_display(view), use_container_width=True)
+    st.dataframe(df_for_display(view), width="stretch")
 
     totals = {}
     grand = 0.0
@@ -2004,7 +2080,7 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
         totals[c] = float(s)
         grand += float(s)
     totals_df = pd.DataFrame([{"Category Totals": "TOTAL (L)", **totals, "GRAND TOTAL (L)": grand}])
-    st.dataframe(df_for_display(totals_df), use_container_width=True)
+    st.dataframe(df_for_display(totals_df), width="stretch")
 
     confirm = st.text_input("Type SAVE to confirm overwrite for this date+zone", key="sheet_save_confirm")
     if st.button("💾 Save Posting Sheet", type="primary"):
@@ -2082,7 +2158,7 @@ elif menu == "📅 Date + Zone View":
     if e_day.empty:
         st.info("No entries for this date/zone.")
     else:
-        e_view = build_entries_view(e_day, want_milk_type_col=False)
+        e_view = build_entries_view_cached(e_day, st.session_state["data_version"], want_milk_type_col=False)
 
         pivot = pd.pivot_table(
             e_view,
@@ -2120,7 +2196,7 @@ elif menu == "📅 Date + Zone View":
 
         st.dataframe(
             pv[["date", "zone", "Retailer", "amount", "payment_mode", "note"]],
-            use_container_width=True
+            width="stretch"
         )
 
         mode_totals = (
@@ -2133,7 +2209,7 @@ elif menu == "📅 Date + Zone View":
         st.subheader("💳 Payment Totals by Mode")
         st.dataframe(
             mode_totals.style.format({"Total (₹)": "₹{:.2f}"}),
-            use_container_width=True
+            width="stretch"
         )
 
 # ================== ZONE-WISE SUMMARY ==================
@@ -2186,10 +2262,10 @@ elif menu == "📍 Zone-wise Summary":
         )
 
         st.caption("Overall totals (all zones combined):")
-        st.dataframe(mode_totals.style.format({"Total (₹)": "₹{:.2f}"}), use_container_width=True)
+        st.dataframe(mode_totals.style.format({"Total (₹)": "₹{:.2f}"}), width="stretch")
 
         st.caption("Zone-wise totals by mode:")
-        st.dataframe(mode_zone.style.format({"Total (₹)": "₹{:.2f}"}), use_container_width=True)
+        st.dataframe(mode_zone.style.format({"Total (₹)": "₹{:.2f}"}), width="stretch")
 
 # ================== EDIT SINGLE ENTRY ==================
 elif menu == "✏️ Edit (Single Entry)":
@@ -2211,10 +2287,10 @@ elif menu == "✏️ Edit (Single Entry)":
         st.info("No entries for this date/zone.")
         st.stop()
 
-    view = build_entries_view(df, want_milk_type_col=False)
+    view = build_entries_view_cached(df, st.session_state["data_version"], want_milk_type_col=False)
     st.dataframe(
         view[["entry_id", "date", "zone", "Retailer", "Category", "qty", "rate", "amount"]],
-        use_container_width=True
+        width="stretch"
     )
 
     entry_id = st.number_input("Entry ID", min_value=1, step=1, key="single_entry_id")
@@ -2297,7 +2373,7 @@ elif menu == "🥛 Milk Categories":
         if categories.empty:
             st.info("No categories yet.")
         else:
-            st.dataframe(categories, use_container_width=True)
+            st.dataframe(categories, width="stretch")
 
             edit_cat = st.selectbox("Select category to edit", categories["name"].tolist(), key="cat_edit_sel")
             cat_data = categories.loc[categories["name"] == edit_cat].iloc[0]
@@ -2401,7 +2477,7 @@ elif menu == "🏪 Retailers":
         if retailers.empty:
             st.info("No retailers yet.")
         else:
-            st.dataframe(retailers, use_container_width=True)
+            st.dataframe(retailers, width="stretch")
 
             edit_ret = st.selectbox("Select retailer to edit", retailers["name"].tolist(), key="ret_edit_sel")
             ret_data = retailers.loc[retailers["name"] == edit_ret].iloc[0]
@@ -2539,7 +2615,7 @@ elif menu == "💰 Price Management":
             view.loc[view["retailer_id"] == GLOBAL_RETAILER_ID, "Retailer"] = "🌍 GLOBAL (All Retailers)"
             view["effective_date"] = pd.to_datetime(view["effective_date"], errors="coerce").dt.strftime("%Y-%m-%d")
             view = view.sort_values(["retailer_id", "category_id", "effective_date"], ascending=[True, True, False])
-            st.dataframe(view[["price_id", "Retailer", "Category", "price", "effective_date"]], use_container_width=True)
+            st.dataframe(view[["price_id", "Retailer", "Category", "price", "effective_date"]], width="stretch")
 
 # ================== LEDGER ==================
 elif menu == "📒 Ledger":
@@ -2559,7 +2635,7 @@ elif menu == "📒 Ledger":
         st.error("From Date cannot be after To Date.")
         st.stop()
 
-    v = build_entries_view(entries_z, want_milk_type_col=False)
+    v = build_entries_view_cached(entries_z, st.session_state["data_version"], want_milk_type_col=False)
     v["date"] = pd.to_datetime(v["date"], errors="coerce").dt.date
     v = v.loc[(v["date"] >= d_from) & (v["date"] <= d_to)].copy()
 
@@ -2595,7 +2671,7 @@ elif menu == "📒 Ledger":
     cat_totals = pivot.sum(axis=0).reset_index()
     cat_totals.columns = ["Category", "Total (L)"]
     cat_totals = cat_totals.sort_values("Total (L)", ascending=False)
-    st.dataframe(cat_totals, use_container_width=True)
+    st.dataframe(cat_totals, width="stretch")
 
 # ================== FILTERS & REPORTS ==================
 elif menu == "🔍 Filters & Reports":
@@ -2640,10 +2716,10 @@ elif menu == "🔍 Filters & Reports":
     if filtered_entries.empty:
         st.info("No data matching the filters")
     else:
-        result_view = build_entries_view(filtered_entries, want_milk_type_col=False)
+        result_view = build_entries_view_cached(filtered_entries, st.session_state["data_version"], want_milk_type_col=False)
         st.dataframe(
             result_view[["date", "zone", "Retailer", "Category", "qty", "rate", "amount"]],
-            use_container_width=True,
+            width="stretch",
         )
 
 # ================== DISTRIBUTORS ==================
@@ -2677,7 +2753,7 @@ elif menu == "🚚 Distributors":
         if distributors.empty:
             st.info("No distributors yet.")
         else:
-            st.dataframe(df_for_display(distributors), use_container_width=True)
+            st.dataframe(df_for_display(distributors), width="stretch")
 
             edit_dis = st.selectbox("Select distributor", distributors["name"].tolist(), key="dist_edit_sel")
             dis_data = distributors.loc[distributors["name"] == edit_dis].iloc[0]
@@ -2846,7 +2922,7 @@ elif menu == "📦 Milk Purchases":
         st.subheader("📋 Purchases")
         st.dataframe(
             view.style.format({"qty": "{:.2f}", "rate": "₹{:.2f}", "amount": "₹{:.2f}"}),
-            use_container_width=True
+            width="stretch"
         )
 
         st.divider()
@@ -2986,7 +3062,7 @@ elif menu == "💸 Distributor Payments":
                 ["date", "payment_id"], ascending=[False, False]
             )
 
-            st.dataframe(view.style.format({"amount": "₹{:.2f}"}), use_container_width=True)
+            st.dataframe(view.style.format({"amount": "₹{:.2f}"}), width="stretch")
 
             st.divider()
             st.subheader("✏️ Edit / Delete Distributor Payment")
@@ -3110,14 +3186,14 @@ elif menu == "📒 Distributor Ledger":
         preview["Total Milk (L)"] = preview["Total Milk (L)"].apply(_disp_2dec_or_dash)
 
 
-    st.dataframe(df_for_display(preview), use_container_width=True)
+    st.dataframe(df_for_display(preview), width="stretch")
 
     st.subheader("💳 Payment Mode Totals (Period)")
     pm = distributor_pay_mode_totals(did, start_day, end_day)
     if pm.empty:
         st.info("No payments in this period.")
     else:
-        st.dataframe(pm.style.format({"Total (₹)": "₹{:.2f}"}), use_container_width=True)
+        st.dataframe(pm.style.format({"Total (₹)": "₹{:.2f}"}), width="stretch")
 
 
 # ================== DISTRIBUTOR BILL ==================
@@ -3188,7 +3264,7 @@ elif menu == "🧾 Distributor Bill":
         preview["Total Milk (L)"] = preview["Total Milk (L)"].apply(_disp_2dec_or_dash)
 
 
-    st.dataframe(df_for_display(preview), use_container_width=True)
+    st.dataframe(df_for_display(preview), width="stretch")
 
     html = build_distributor_bill_html(drow, start_day, end_day, grid, pm, cat_names)
 
@@ -3254,7 +3330,7 @@ elif menu == "🗑️ Milk Wastage":
             view["date"] = _safe_dt(view["date"]).dt.strftime("%Y-%m-%d")
             view = view.merge(categories[["category_id", "name"]], on="category_id", how="left").rename(columns={"name": "Category"})
             view = view[["wastage_id", "date", "Category", "qty", "reason", "estimated_loss"]].sort_values(["date", "wastage_id"], ascending=[False, False])
-            st.dataframe(view.style.format({"qty": "{:.2f}", "estimated_loss": "₹{:.2f}"}), use_container_width=True)
+            st.dataframe(view.style.format({"qty": "{:.2f}", "estimated_loss": "₹{:.2f}"}), width="stretch")
 
             st.divider()
             st.subheader("✏️ Edit / Delete Wastage")
@@ -3359,7 +3435,7 @@ elif menu == "💼 Expenses":
             view = view[["expense_id", "date", "category", "description", "amount", "payment_mode", "paid"]].sort_values(
                 ["date", "expense_id"], ascending=[False, False]
             )
-            st.dataframe(view.style.format({"amount": "₹{:.2f}"}), use_container_width=True)
+            st.dataframe(view.style.format({"amount": "₹{:.2f}"}), width="stretch")
 
             st.divider()
             st.subheader("✏️ Edit / Delete Expense")
@@ -3538,13 +3614,13 @@ elif menu == "🧾 Generate Bill":
     if "Total Milk (L)" in preview.columns:
         preview["Total Milk (L)"] = preview["Total Milk (L)"].apply(_disp_2dec_or_dash)
 
-    st.dataframe(df_for_display(preview), use_container_width=True)
+    st.dataframe(df_for_display(preview), width="stretch")
 
     st.subheader("💳 Payment Mode Totals (Period)")
     if pay_mode_totals.empty:
         st.info("No payments in this period.")
     else:
-        st.dataframe(pay_mode_totals.style.format({"Total (₹)": "₹{:.2f}"}), use_container_width=True)
+        st.dataframe(pay_mode_totals.style.format({"Total (₹)": "₹{:.2f}"}), width="stretch")
 
     html = build_bill_html(rrow, start_day, end_day, grid, pay_mode_totals, cat_names, opening_due)
 
@@ -3575,10 +3651,23 @@ elif menu == "🛡️ Data Health & Backup":
     st.header("🛡️ Data Health & Backup")
 
     st.subheader("Backups")
-    st.info("Backups are disabled in Supabase mode. No local CSV or ZIP backups are created.")
-
-    st.subheader("Create Full Backup ZIP")
-    st.warning("Backup ZIP is disabled in Supabase mode.")
+    st.caption("Download a ZIP containing CSV exports of all tables currently in the app.")
+    dv = st.session_state.get("data_version", 0)
+    # Keep bytes stable across reruns to avoid duplicate downloads in some browsers.
+    if st.session_state.get("backup_zip_version") != dv or "backup_zip_bytes" not in st.session_state:
+        st.session_state["backup_zip_bytes"] = make_full_backup_zip(dv)
+        st.session_state["backup_zip_version"] = dv
+        
+    zip_bytes = st.session_state["backup_zip_bytes"]
+    
+    st.download_button(
+        "⬇️ Download Full Backup ZIP (CSV)",
+        data=zip_bytes,
+        file_name=f"milk_accounting_backup_{date.today().isoformat()}.zip",
+        mime="application/zip",
+        key=f"backup_zip_{dv}",
+        width="stretch",
+    )
 
 
     st.divider()
