@@ -222,6 +222,7 @@ def make_full_backup_zip(data_version: int) -> bytes:
             zf.writestr(f"{name}.csv", csv_bytes)
     return buf.getvalue()
 
+@st.cache_data(show_spinner=False)
 def load_and_migrate_data_cached(_version: int):
     """Cached wrapper: prevents full-table fetch on every widget interaction."""
     return load_and_migrate_data()
@@ -292,6 +293,7 @@ def sb_next_id(table: str, pk: str) -> int:
     Get next integer ID safely from DB (max(pk)+1).
     Prevents collisions across multiple sessions/users.
     """
+    sb = get_sb()
     resp = sb.table(table).select(pk).order(pk, desc=True).limit(1).execute()
     data = resp.data or []
     if not data:
@@ -387,6 +389,18 @@ def parse_boolish_active(v) -> bool:
     except Exception:
         return True  # default active
 
+def fmt_zero_dash(x) -> str:
+    """Format numeric values; show en-dash for zero/blank/invalid."""
+    if x in (None, "", "–", "-", "—"):
+        v = 0.0
+    else:
+        try:
+            v = float(x)
+        except Exception:
+            v = 0.0
+    return "–" if v == 0.0 else f"{v:.2f}"
+
+
 def parse_boolish_paid(v) -> bool:
     if v is None:
         return False
@@ -422,6 +436,7 @@ def df_for_display(df: pd.DataFrame) -> pd.DataFrame:
     return df.replace({None: "–"}).fillna("–")
 
 def sb_fetch_all(table: str, cols="*", page_size: int = 1000, max_retries: int = 5):
+    sb = get_sb()
     out = []
     offset = 0
 
@@ -476,6 +491,7 @@ def sb_fetch_where(table: str, cols: str = "*", filters: list[tuple] | None = No
     Fetch rows from Supabase table with server-side filters.
     Supported ops: eq, lt, lte, gt, gte, in
     """
+    sb = get_sb()
     filters = filters or []
     base = sb.table(table).select(cols)
 
@@ -557,37 +573,72 @@ def _prepare_df_for_write(df: pd.DataFrame, path: str) -> pd.DataFrame:
     # Keep stable column order to match schema.
     return df[expected_cols]
 
-def sb_insert_df(df: pd.DataFrame, path: str) -> None:
-    # Allow passing a dict/list by mistake (common from UI code)
+def sb_insert_df(df: object, path: str) -> None:
+    # Normalize inputs: allow dict / list[dict] / DataFrame
     if isinstance(df, dict):
         df = pd.DataFrame([df])
     elif isinstance(df, list):
         df = pd.DataFrame(df)
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(f"sb_insert_df expects a DataFrame/dict/list[dict], got {type(df)}")
 
+    """Insert rows into Supabase and then persist a local snapshot CSV.
 
-    if path not in FILE_TO_TABLE:
-        raise ValueError(f"Unknown mapping for: {path}")
+    Supports tables where the primary key is GENERATED in Postgres (IDENTITY / serial).
+    In that case you may pass a dataframe WITHOUT the pk column, or with pk all-NULL.
+    We insert without the pk and then use the returned rows (with generated pk) for the snapshot.
+    """
     table, pk = FILE_TO_TABLE[path]
+    # Ensure primary key column exists and is non-NULL (avoid DB identity surprises)
+    if pk not in df.columns:
+        df[pk] = None
+    if df[pk].isna().any():
+        # Fill only missing PKs; keep explicit IDs if provided
+        next_id = sb_next_id(table, pk)
+        mask = df[pk].isna()
+        df.loc[mask, pk] = range(next_id, next_id + int(mask.sum()))
+
+
+    # Accept dict / list[dict] input (some call sites build a single-row dict)
+    if isinstance(df, dict):
+        df = pd.DataFrame([df])
+    elif isinstance(df, list) and df and isinstance(df[0], dict):
+        df = pd.DataFrame(df)
 
     df = _prepare_df_for_write(df, path)
-    if df.empty:
-        return
 
-    if USE_DB_IDS:
-        if pk not in df.columns:
-            raise RuntimeError(f"{table}: missing primary key column '{pk}' in dataframe")
-        if df[pk].isna().all():
-            payload = df.drop(columns=[pk], errors="ignore")
-            records = payload.where(pd.notna(payload), None).to_dict(orient="records")
-            chunk = 500
-            for i in range(0, len(records), chunk):
-                sb.table(table).insert(records[i:i+chunk]).execute()
-            return
+    # If pk is missing OR entirely NULL -> treat as DB-generated PK.
+    pk_missing = pk not in df.columns
+    pk_all_null = (not pk_missing) and df[pk].isna().all()
+
+    records = df.to_dict(orient="records")
+
+    # Strip pk when DB generates it, to avoid NOT NULL violations and to let identity work.
+    if pk_missing or pk_all_null:
+        for r in records:
+            r.pop(pk, None)
+
+        resp = sb.table(table).insert(records).execute()
+        inserted = resp.data or []
+        if not inserted:
+            raise RuntimeError(f"{table}: insert returned no rows")
+        df = pd.DataFrame(inserted)
+        df = _prepare_df_for_write(df, path)
+    else:
+        # Safety: reject mixed NULL / non-NULL pk values (usually a bug in the UI)
         if df[pk].isna().any():
-            raise RuntimeError(f"{table}: mixed NULL/non-NULL primary keys with use_db_ids enabled")
+            raise RuntimeError(f"{table}: mixed NULL/non-NULL primary keys while inserting")
 
+        for i in range(0, len(records), 500):
+            sb.table(table).insert(records[i:i+500]).execute()
+
+    # Persist snapshot + refresh caches
     safe_write_csv(df, path, allow_empty=False)
+    invalidate_data_cache()
+
+
 def sb_delete_by_pk(table: str, pk: str, ids: list[int], chunk: int = 500) -> None:
+    sb = get_sb()
     ids = [int(x) for x in ids if x is not None]
     if not ids:
         return
@@ -606,6 +657,7 @@ def sb_delete_where(table: str, filters: list[tuple], in_chunk: int = 500) -> No
       ("retailer_id","in",[1,2,3])
     Supported ops: eq, lt, lte, gt, gte, in
     """
+    sb = get_sb()
     base = sb.table(table).delete()
 
     in_filters = []
@@ -2171,7 +2223,8 @@ elif menu == "📅 Date + Zone View":
 
         display = pivot.copy()
         for c in display.columns:
-            display[c] = display[c].apply(lambda x: "–" if float(x) == 0.0 else f"{float(x):.2f}")
+            vals = pd.to_numeric(display[c], errors="coerce").fillna(0.0)
+            display[c] = vals.apply(lambda v: "–" if float(v) == 0.0 else f"{float(v):.2f}")
         display["TOTAL (L)"] = pivot.sum(axis=1).apply(lambda x: f"{float(x):.2f}")
 
         totals = {c: float(pivot[c].sum()) for c in pivot.columns}
@@ -2229,7 +2282,7 @@ elif menu == "📍 Zone-wise Summary":
         for c in display.columns:
             if c in ("Zone", "TOTAL (L)"):
                 continue
-            display[c] = display[c].apply(lambda x: "–" if float(x or 0.0) == 0.0 else f"{float(x):.2f}")
+            display[c] = display[c].apply(fmt_zero_dash)
 
         numeric_cols = [c for c in pivot.columns if c != "Zone"]
         grand = {"Zone": "GRAND TOTAL"}
@@ -2354,7 +2407,6 @@ elif menu == "🥛 Milk Categories":
             table, pk = FILE_TO_TABLE[CATEGORIES_FILE]
             
             new_row = pd.DataFrame([{
-                "category_id": sb_new_id(table, pk),   # ✅ THIS IS THE FIX
                 "name": name.strip(),
                 "description": description.strip() if description else "",
                 "default_price": float(default_price),
@@ -2654,7 +2706,7 @@ elif menu == "📒 Ledger":
 
     display = pivot.copy()
     for c in display.columns:
-        display[c] = display[c].apply(lambda x: "–" if float(x or 0.0) == 0.0 else f"{float(x):.2f}")
+        display[c] = display[c].apply(fmt_zero_dash)
 
     display["TOTAL (L)"] = pivot.sum(axis=1).apply(lambda x: f"{float(x):.2f}")
 
