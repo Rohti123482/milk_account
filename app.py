@@ -9,7 +9,6 @@ import zipfile
 import io
 import plotly.express as px
 from pandas.errors import EmptyDataError, ParserError
-from html import escape as html_escape
 
 # ================== PAGE CONFIG ==================
 st.set_page_config(page_title="Milk Accounting Pro", layout="wide", initial_sidebar_state="expanded")
@@ -575,12 +574,6 @@ def _prepare_df_for_write(df: pd.DataFrame, path: str) -> pd.DataFrame:
     return df[expected_cols]
 
 def sb_insert_df(df: object, path: str) -> None:
-    """Insert rows into Supabase and then persist a local snapshot CSV.
-
-    Supports tables where the primary key is GENERATED in Postgres (IDENTITY / serial).
-    In that case you may pass a dataframe WITHOUT the pk column, or with pk all-NULL.
-    We insert without the pk and then use the returned rows (with generated pk) for the snapshot.
-    """
     # Normalize inputs: allow dict / list[dict] / DataFrame
     if isinstance(df, dict):
         df = pd.DataFrame([df])
@@ -589,6 +582,12 @@ def sb_insert_df(df: object, path: str) -> None:
     if not isinstance(df, pd.DataFrame):
         raise TypeError(f"sb_insert_df expects a DataFrame/dict/list[dict], got {type(df)}")
 
+    """Insert rows into Supabase and then persist a local snapshot CSV.
+
+    Supports tables where the primary key is GENERATED in Postgres (IDENTITY / serial).
+    In that case you may pass a dataframe WITHOUT the pk column, or with pk all-NULL.
+    We insert without the pk and then use the returned rows (with generated pk) for the snapshot.
+    """
     table, pk = FILE_TO_TABLE[path]
     # Ensure primary key column exists and is non-NULL (avoid DB identity surprises)
     if pk not in df.columns:
@@ -598,6 +597,13 @@ def sb_insert_df(df: object, path: str) -> None:
         next_id = sb_next_id(table, pk)
         mask = df[pk].isna()
         df.loc[mask, pk] = range(next_id, next_id + int(mask.sum()))
+
+
+    # Accept dict / list[dict] input (some call sites build a single-row dict)
+    if isinstance(df, dict):
+        df = pd.DataFrame([df])
+    elif isinstance(df, list) and df and isinstance(df[0], dict):
+        df = pd.DataFrame(df)
 
     df = _prepare_df_for_write(df, path)
 
@@ -1473,10 +1479,7 @@ def compute_today_sales_amount_for_row(rid: int, day: date, row: pd.Series, cat_
         qty = float(row.get(cat_name, 0.0) or 0.0)
         if qty <= 0:
             continue
-        cat_row = categories_active.loc[categories_active["name"] == cat_name]
-        if cat_row.empty:
-            raise ValueError(f"Category '{cat_name}' not found")
-        cid = int(cat_row.iloc[0]["category_id"])
+        cid = int(categories_active.loc[categories_active["name"] == cat_name, "category_id"].iloc[0])
         rate = get_price_for_date(rid, cid, day)
         if rate is None or rate <= 0:
             raise ValueError(f"Price missing for Retailer ID {rid} / {cat_name} on {day}")
@@ -1677,15 +1680,20 @@ def build_bill_daily_grid(retailer_id: int, start_day: date, end_day: date, cat_
 
     return pd.DataFrame(rows)
 
-def build_bill_html(retailer_row: dict, start_day: date, end_day: date, grid: pd.DataFrame,
-                    pay_mode_totals: pd.DataFrame, cat_names: list[str], opening_due: float) -> str:
-    """Build printable bill HTML with professional format (no rate columns)."""
-    
+def build_bill_html(
+    retailer_row: dict,
+    start_day: date,
+    end_day: date,
+    grid: pd.DataFrame,
+    pay_mode_totals: pd.DataFrame,
+    cat_names: list[str],
+    opening_due: float,
+) -> str:
     shop_name = "JYOTIRLING MILK SUPPLIER"
-    cust = retailer_row.get("name", "–") if retailer_row.get("name") else "–"
-    zone = retailer_row.get("zone", "–") if retailer_row.get("zone") else "–"
-    contact = retailer_row.get("phone", "–") if retailer_row.get("phone") else "–"
-    address = retailer_row.get("address", "–") if retailer_row.get("address") else "–"
+    cust = display_or_dash(retailer_row.get("name"))
+    zone = display_or_dash(retailer_row.get("zone"))
+    contact = display_or_dash(retailer_row.get("contact"))
+    address = display_or_dash(retailer_row.get("address"))
 
     def esc(s: str) -> str:
         return (
@@ -1697,15 +1705,11 @@ def build_bill_html(retailer_row: dict, start_day: date, end_day: date, grid: pd
         )
 
     def fmt_money(x) -> str:
-        try:
-            return f"₹{float(x):.2f}"
-        except Exception:
-            return "₹0.00"
+        return _fmt_money(x)
 
     def fmt_num(x) -> str:
         try:
-            fv = float(x)
-            return "–" if fv == 0 else f"{fv:.2f}"
+            return f"{float(x):.2f}"
         except Exception:
             return "–"
 
@@ -1750,7 +1754,7 @@ def build_bill_html(retailer_row: dict, start_day: date, end_day: date, grid: pd
 
     th = "<th>Date</th>"
     for cat in cat_names:
-        th += f"<th>{esc(cat)} Qty</th>"
+        th += f"<th>{esc(cat)} Qty</th><th>{esc(cat)} Rate</th>"
     th += "<th>Total Milk (L)</th><th>Sales (₹)</th><th>Payment (₹)</th><th>Running Due (₹)</th>"
 
     body_rows = ""
@@ -1759,7 +1763,10 @@ def build_bill_html(retailer_row: dict, start_day: date, end_day: date, grid: pd
 
         for cat in cat_names:
             qcol = f"{cat} Qty"
+            rcol = f"{cat} Rate"
+
             qv = r.get(qcol, "-")
+            rv = r.get(rcol, "-")
 
             if qv == "-" or qv is None:
                 qdisp = "–"
@@ -1770,7 +1777,16 @@ def build_bill_html(retailer_row: dict, start_day: date, end_day: date, grid: pd
                 except Exception:
                     qdisp = "–"
 
-            tds += f"<td style='text-align:right'>{qdisp}</td>"
+            if rv == "-" or rv is None:
+                rdisp = "–"
+            else:
+                try:
+                    fr = float(rv)
+                    rdisp = f"{fr:.2f}"
+                except Exception:
+                    rdisp = "–"
+
+            tds += f"<td style='text-align:right'>{qdisp}</td><td style='text-align:right'>{rdisp}</td>"
 
         tds += f"<td style='text-align:right'>{fmt_num(r.get('Total Milk (L)', 0.0))}</td>"
         tds += f"<td style='text-align:right'>{fmt_money(r.get('Sales (₹)', 0.0))}</td>"
@@ -1781,7 +1797,7 @@ def build_bill_html(retailer_row: dict, start_day: date, end_day: date, grid: pd
 
     total_row = "<td><b>TOTAL</b></td>"
     for cat in cat_names:
-        total_row += f"<td style='text-align:right'><b>{total_qty_by_cat[cat]:.2f}</b></td>"
+        total_row += f"<td style='text-align:right'><b>{total_qty_by_cat[cat]:.2f}</b></td><td style='text-align:right'><b>–</b></td>"
     total_milk_all = float(sum(total_qty_by_cat.values()))
     total_row += f"<td style='text-align:right'><b>{total_milk_all:.2f}</b></td>"
     total_row += f"<td style='text-align:right'><b>{fmt_money(total_sales)}</b></td>"
@@ -1877,9 +1893,10 @@ def build_bill_html(retailer_row: dict, start_day: date, end_day: date, grid: pd
 </html>
 """
     return html
+# PDF generation intentionally disabled.
+# HTML is the single source of truth for printing.
 
 def bill_pdf_bytes_from_html(html: str):
-    """PDF generation not yet implemented. Return None to disable PDF downloads."""
     return None
 
 # ================== SIDEBAR: ZONE CONTEXT ==================
@@ -2069,11 +2086,7 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
             qty = float(row.get(cat_name, 0.0) or 0.0)
             if qty <= 0:
                 continue
-            cat_row = categories_active.loc[categories_active["name"] == cat_name]
-            if cat_row.empty:
-                st.error(f"Category '{cat_name}' not found.")
-                st.stop()
-            cid = int(cat_row.iloc[0]["category_id"])
+            cid = int(categories_active.loc[categories_active["name"] == cat_name, "category_id"].iloc[0])
             rate = get_price_for_date(rid, cid, posting_date)
             if rate is None or rate <= 0:
                 st.error(f"❌ Missing price for Retailer ID {rid} / {cat_name} on {posting_date}")
@@ -2158,11 +2171,7 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
                 qty = float(row.get(cat_name, 0.0) or 0.0)
                 if qty <= 0:
                     continue
-                cat_row = categories_active.loc[categories_active["name"] == cat_name]
-                if cat_row.empty:
-                    st.error(f"Category '{cat_name}' not found.")
-                    st.stop()
-                cid = int(cat_row.iloc[0]["category_id"])
+                cid = int(categories_active.loc[categories_active["name"] == cat_name, "category_id"].iloc[0])
                 rate = float(get_price_for_date(rid, cid, posting_date))
                 amount = qty * rate
                 eid = None if next_entry_id is None else next_entry_id
@@ -2419,11 +2428,7 @@ elif menu == "🥛 Milk Categories":
             st.dataframe(categories, width="stretch")
 
             edit_cat = st.selectbox("Select category to edit", categories["name"].tolist(), key="cat_edit_sel")
-            cat_row = categories.loc[categories["name"] == edit_cat]
-            if cat_row.empty:
-                st.error("Category not found.")
-                st.stop()
-            cat_data = cat_row.iloc[0]
+            cat_data = categories.loc[categories["name"] == edit_cat].iloc[0]
             cid = int(cat_data["category_id"])
 
             col1, col2, col3, col4 = st.columns(4)
@@ -2527,11 +2532,7 @@ elif menu == "🏪 Retailers":
             st.dataframe(retailers, width="stretch")
 
             edit_ret = st.selectbox("Select retailer to edit", retailers["name"].tolist(), key="ret_edit_sel")
-            ret_row = retailers.loc[retailers["name"] == edit_ret]
-            if ret_row.empty:
-                st.error("Retailer not found.")
-                st.stop()
-            ret_data = ret_row.iloc[0]
+            ret_data = retailers.loc[retailers["name"] == edit_ret].iloc[0]
             rid = int(ret_data["retailer_id"])
 
             col1, col2, col3, col4 = st.columns(4)
@@ -2627,11 +2628,7 @@ elif menu == "💰 Price Management":
 
         with col2:
             category_name = st.selectbox("Milk Category", categories_active["name"].tolist(), key="price_category")
-            cat_row = categories_active.loc[categories_active["name"] == category_name]
-            if cat_row.empty:
-                st.error("Category not found.")
-                st.stop()
-            cat_row = cat_row.iloc[0]
+            cat_row = categories_active.loc[categories_active["name"] == category_name].iloc[0]
             cid = int(cat_row["category_id"])
 
         with col3:
@@ -2645,11 +2642,8 @@ elif menu == "💰 Price Management":
                 st.warning("Price must be > 0")
             else:
                 if scope == "🏪 Specific Retailer Override":
-                    rid_row = retailers_active.loc[retailers_active["name"] == retailer_name]
-                    if rid_row.empty:
-                        st.error("Retailer not found.")
-                        st.stop()
-                    target_retailer_id = int(rid_row.iloc[0]["retailer_id"])
+                    rid = int(retailers_active.loc[retailers_active["name"] == retailer_name, "retailer_id"].values[0])
+                    target_retailer_id = rid
                 else:
                     target_retailer_id = GLOBAL_RETAILER_ID
 
@@ -2907,18 +2901,10 @@ elif menu == "📦 Milk Purchases":
         with c4:
             qty = st.number_input("Qty (L)", min_value=0.0, step=0.5, format="%g", key="pur_qty")
 
-        drow = distributors.loc[distributors["name"] == dis_name]
-        if drow.empty:
-            st.error("Distributor not found.")
-            st.stop()
-        drow = drow.iloc[0]
+        drow = distributors.loc[distributors["name"] == dis_name].iloc[0]
         did = int(drow["distributor_id"])
 
-        crow = categories.loc[categories["name"] == cat_name]
-        if crow.empty:
-            st.error("Category not found.")
-            st.stop()
-        crow = crow.iloc[0]
+        crow = categories.loc[categories["name"] == cat_name].iloc[0]
         cid = int(crow["category_id"])
 
         default_rate = float(pd.to_numeric(crow.get("default_price", 0.0), errors="coerce") or 0.0)
@@ -3007,16 +2993,10 @@ elif menu == "📦 Milk Purchases":
 
         # current names for dropdown defaults
         cur_dis_name = distributors.loc[distributors["distributor_id"] == cur_did, "name"]
-        if cur_dis_name.empty:
-            cur_dis_name = distributors["name"].iloc[0] if not distributors.empty else "Unknown"
-        else:
-            cur_dis_name = cur_dis_name.iloc[0]
+        cur_dis_name = cur_dis_name.iloc[0] if not cur_dis_name.empty else distributors["name"].iloc[0]
 
         cur_cat_name = categories.loc[categories["category_id"] == cur_cid, "name"]
-        if cur_cat_name.empty:
-            cur_cat_name = categories["name"].iloc[0] if not categories.empty else "Unknown"
-        else:
-            cur_cat_name = cur_cat_name.iloc[0]
+        cur_cat_name = cur_cat_name.iloc[0] if not cur_cat_name.empty else categories["name"].iloc[0]
 
         e1, e2, e3, e4 = st.columns(4)
         with e1:
@@ -3039,17 +3019,8 @@ elif menu == "📦 Milk Purchases":
             new_qty = st.number_input("Qty (L)", min_value=0.0, step=0.5, format="%g", value=cur_qty, key="pur_edit_qty")
 
         # map selected names to ids
-        new_did_row = distributors.loc[distributors["name"] == new_dis_name, "distributor_id"]
-        new_did = int(new_did_row.iloc[0]) if not new_did_row.empty else 0
-        if new_did == 0:
-            st.error("Distributor not found.")
-            st.stop()
-        
-        new_cid_row = categories.loc[categories["name"] == new_cat_name, "category_id"]
-        new_cid = int(new_cid_row.iloc[0]) if not new_cid_row.empty else 0
-        if new_cid == 0:
-            st.error("Category not found.")
-            st.stop()
+        new_did = int(distributors.loc[distributors["name"] == new_dis_name, "distributor_id"].iloc[0])
+        new_cid = int(categories.loc[categories["name"] == new_cat_name, "category_id"].iloc[0])
 
         new_rate = st.number_input("Rate (₹/L)", min_value=0.0, step=0.5, format="%g", value=cur_rate, key="pur_edit_rate")
 
@@ -3113,11 +3084,7 @@ elif menu == "💸 Distributor Payments":
             mode = st.selectbox("Payment Mode", ["Cash", "UPI", "Bank", "Cheque", "Other"], key="dpay_mode")
 
         note = st.text_input("Note (optional)", key="dpay_note")
-        dis_row = distributors.loc[distributors["name"] == dis_name]
-        if dis_row.empty:
-            st.error("Distributor not found.")
-            st.stop()
-        did = int(dis_row.iloc[0]["distributor_id"])
+        did = int(distributors.loc[distributors["name"] == dis_name, "distributor_id"].iloc[0])
 
         if st.button("Save Distributor Payment", type="primary", key="dpay_save"):
             if amt <= 0:
@@ -3221,11 +3188,7 @@ elif menu == "📒 Distributor Ledger":
         st.stop()
 
     dis_name = st.selectbox("Select Distributor", distributors["name"].tolist(), key="dl_dis")
-    dis_row = distributors.loc[distributors["name"] == dis_name]
-    if dis_row.empty:
-        st.error("Distributor not found.")
-        st.stop()
-    did = int(dis_row.iloc[0]["distributor_id"])
+    did = int(distributors.loc[distributors["name"] == dis_name, "distributor_id"].iloc[0])
 
     colA, colB = st.columns(2)
     with colA:
@@ -3297,11 +3260,7 @@ elif menu == "🧾 Distributor Bill":
         st.stop()
 
     dis_name = st.selectbox("Select Distributor", distributors["name"].tolist(), key="db_dis")
-    dis_row = distributors.loc[distributors["name"] == dis_name]
-    if dis_row.empty:
-        st.error("Distributor not found.")
-        st.stop()
-    did = int(dis_row.iloc[0]["distributor_id"])
+    did = int(distributors.loc[distributors["name"] == dis_name, "distributor_id"].iloc[0])
 
     colA, colB = st.columns(2)
     with colA:
@@ -3595,7 +3554,6 @@ elif menu == "💼 Expenses":
                             st.rerun()
 
 # ================== GENERATE BILL ==================
-
 elif menu == "🧾 Generate Bill":
     st.header("🧾 Generate Professional Customer Bill (Printable + Downloadable)")
 
@@ -3615,11 +3573,7 @@ elif menu == "🧾 Generate Bill":
         st.stop()
 
     retailer_name = st.selectbox("Select Customer (Retailer)", rlist["name"].tolist(), key="bill_retailer")
-    rid_row = rlist.loc[rlist["name"] == retailer_name]
-    if rid_row.empty:
-        st.error("Retailer not found.")
-        st.stop()
-    rid = int(rid_row.iloc[0]["retailer_id"])
+    rid = int(rlist.loc[rlist["name"] == retailer_name, "retailer_id"].iloc[0])
 
     colA, colB = st.columns(2)
     with colA:
@@ -3631,54 +3585,12 @@ elif menu == "🧾 Generate Bill":
         st.error("From Date cannot be after To Date.")
         st.stop()
 
-    # Fetch entries for this retailer + date range (server-side if enabled)
-    if USE_SERVER_FILTERS:
-        e = sb_fetch_df(
-            ENTRIES_FILE,
-            CSV_SCHEMAS[ENTRIES_FILE],
-            filters=[
-                ("retailer_id", "eq", int(rid)),
-                ("date", "gte", str(start_day)),
-                ("date", "lte", str(end_day)),
-            ],
-        )
-    else:
-        e = entries.copy()
-        if not e.empty:
-            e["date"] = _safe_dt(e["date"]).dt.date
-            e = e.loc[
-                (e["retailer_id"].astype(int) == int(rid)) &
-                (e["date"] >= start_day) &
-                (e["date"] <= end_day)
-            ].copy()
-
-    if e.empty:
-        st.warning("No purchases found in this date range.")
-        st.stop()
-
-    # Only categories that this retailer actually purchased in this period (qty > 0)
-    e["qty"] = pd.to_numeric(e.get("qty", 0), errors="coerce").fillna(0.0)
-    used_cat_ids = (
-        e.loc[e["qty"] > 0, "category_id"]
-         .dropna()
-         .astype(int)
-         .unique()
-         .tolist()
-    )
-
-    cat_df = categories.copy()
-    if "is_active" in cat_df.columns:
-        cat_df = cat_df.loc[cat_df["is_active"] == True].copy()
-    if used_cat_ids:
-        cat_df = cat_df.loc[cat_df["category_id"].astype(int).isin(used_cat_ids)].copy()
-    else:
-        cat_df = cat_df.iloc[0:0].copy()
-
-    cat_names = cat_df.get("name", pd.Series([], dtype=str)).dropna().astype(str).tolist()
+    cat_df = categories_active.copy() if not categories_active.empty else categories.copy()
+    cat_names = cat_df["name"].dropna().astype(str).tolist()
     cat_names = sorted(list(dict.fromkeys(cat_names)))
 
     if not cat_names:
-        st.warning("No purchased categories found in this date range.")
+        st.error("No categories found.")
         st.stop()
 
     rrow = retailers.loc[retailers["retailer_id"].astype(int) == rid].iloc[0].to_dict()
@@ -3689,7 +3601,6 @@ elif menu == "🧾 Generate Bill":
     opening_due = retailer_balance_before(rid, start_day)
     closing_due = float(pd.to_numeric(grid["Running Due (₹)"], errors="coerce").fillna(opening_due).iloc[-1]) if not grid.empty else float(opening_due)
 
-    # Payments (for mode totals)
     if USE_SERVER_FILTERS:
         p = sb_fetch_df(
             PAYMENTS_FILE,
@@ -3734,24 +3645,24 @@ elif menu == "🧾 Generate Bill":
 
     st.divider()
 
-    st.subheader("📌 Bill Preview (No Rates)")
+    st.subheader("📌 Bill Preview (Arrow-safe)")
 
     preview = grid.copy()
-
-    # Hide rate columns in preview as well
-    rate_cols = [f"{cat} Rate" for cat in cat_names if f"{cat} Rate" in preview.columns]
-    if rate_cols:
-        preview = preview.drop(columns=rate_cols)
-
+    
     for cat in cat_names:
         qcol = f"{cat} Qty"
+        rcol = f"{cat} Rate"
+        
         if qcol in preview.columns:
             preview[qcol] = preview[qcol].apply(_disp_2dec_or_dash)
-
+            
+        if rcol in preview.columns:
+            preview[rcol] = preview[rcol].apply(_disp_rate_or_dash)
+            
     for c in ["Sales (₹)", "Payment (₹)", "Running Due (₹)"]:
         if c in preview.columns:
             preview[c] = preview[c].apply(_fmt_money)
-
+            
     if "Total Milk (L)" in preview.columns:
         preview["Total Milk (L)"] = preview["Total Milk (L)"].apply(_disp_2dec_or_dash)
 
@@ -3787,6 +3698,7 @@ elif menu == "🧾 Generate Bill":
             key="bill_dl_pdf",
         )
 
+# ================== DATA HEALTH & BACKUP ==================
 elif menu == "🛡️ Data Health & Backup":
     st.header("🛡️ Data Health & Backup")
 
