@@ -1720,7 +1720,8 @@ def build_bill_html(
     total_pay = 0.0
     closing_due = float(opening_due)
 
-    if not df.empty:
+    if df is not None and not df.empty:
+        # Totals by category qty
         for cat in cat_names:
             qcol = f"{cat} Qty"
             if qcol in df.columns:
@@ -1732,72 +1733,68 @@ def build_bill_html(
                         pass
                 total_qty_by_cat[cat] = float(s)
 
-        total_sales = float(pd.to_numeric(df.get("Sales (₹)"), errors="coerce").fillna(0).sum()) if "Sales (₹)" in df.columns else 0.0
-        total_pay = float(pd.to_numeric(df.get("Payment (₹)"), errors="coerce").fillna(0).sum()) if "Payment (₹)" in df.columns else 0.0
-        if "Running Due (₹)" in df.columns and len(df) > 0:
-            closing_due = float(pd.to_numeric(df["Running Due (₹)"], errors="coerce").fillna(opening_due).iloc[-1])
+        # Period totals
+        if "Sales (₹)" in df.columns:
+            total_sales = float(pd.to_numeric(df["Sales (₹)"], errors="coerce").fillna(0).sum())
+        if "Payment (₹)" in df.columns:
+            total_pay = float(pd.to_numeric(df["Payment (₹)"], errors="coerce").fillna(0).sum())
 
+        # Closing due = last running due (if present)
+        if "Running Due (₹)" in df.columns and not df.empty:
+            closing_due = float(
+                pd.to_numeric(df["Running Due (₹)"], errors="coerce")
+                .fillna(opening_due)
+                .iloc[-1]
+            )
+
+    # Payment mode totals rows
     pay_rows_html = ""
     if pay_mode_totals is not None and not pay_mode_totals.empty:
         pm = pay_mode_totals.copy()
-        if "Mode" not in pm.columns and "payment_mode" in pm.columns:
-            pm = pm.rename(columns={"payment_mode": "Mode"})
-        if "Total (₹)" not in pm.columns and "amount" in pm.columns:
-            pm = pm.rename(columns={"amount": "Total (₹)"})
-
         for _, r in pm.iterrows():
-            mode = esc(r.get("Mode", "–"))
+            mode = esc(r.get("Mode", "-"))
             amt = fmt_money(r.get("Total (₹)", 0.0))
             pay_rows_html += f"<tr><td>{mode}</td><td style='text-align:right'>{amt}</td></tr>"
     else:
         pay_rows_html = "<tr><td colspan='2' style='text-align:center;color:#666'>No payments in this period</td></tr>"
 
+    # ========= TABLE HEADER (Rate removed) =========
     th = "<th>Date</th>"
     for cat in cat_names:
-        th += f"<th>{esc(cat)} Qty</th><th>{esc(cat)} Rate</th>"
+        th += f"<th>{esc(cat)} Qty</th>"
     th += "<th>Total Milk (L)</th><th>Sales (₹)</th><th>Payment (₹)</th><th>Running Due (₹)</th>"
 
+    # ========= TABLE BODY (Rate removed) =========
     body_rows = ""
-    for _, r in df.iterrows():
-        tds = f"<td>{esc(r.get('Date',''))}</td>"
+    for _, r in df.iterrows() if df is not None else []:
+        tds = f"<td>{esc(r.get('Date','-'))}</td>"
 
         for cat in cat_names:
             qcol = f"{cat} Qty"
-            rcol = f"{cat} Rate"
-
             qv = r.get(qcol, "-")
-            rv = r.get(rcol, "-")
 
             if qv == "-" or qv is None:
-                qdisp = "–"
+                qdisp = "-"
             else:
                 try:
                     fq = float(qv)
-                    qdisp = "–" if fq == 0 else f"{fq:.2f}"
+                    qdisp = "-" if fq == 0 else f"{fq:.2f}"
                 except Exception:
-                    qdisp = "–"
+                    qdisp = "-"
 
-            if rv == "-" or rv is None:
-                rdisp = "–"
-            else:
-                try:
-                    fr = float(rv)
-                    rdisp = f"{fr:.2f}"
-                except Exception:
-                    rdisp = "–"
-
-            tds += f"<td style='text-align:right'>{qdisp}</td><td style='text-align:right'>{rdisp}</td>"
+            tds += f"<td style='text-align:right'>{qdisp}</td>"
 
         tds += f"<td style='text-align:right'>{fmt_num(r.get('Total Milk (L)', 0.0))}</td>"
         tds += f"<td style='text-align:right'>{fmt_money(r.get('Sales (₹)', 0.0))}</td>"
         tds += f"<td style='text-align:right'>{fmt_money(r.get('Payment (₹)', 0.0))}</td>"
         tds += f"<td style='text-align:right'>{fmt_money(r.get('Running Due (₹)', 0.0))}</td>"
-
         body_rows += f"<tr>{tds}</tr>"
 
+    # ========= TOTAL ROW (Rate removed) =========
     total_row = "<td><b>TOTAL</b></td>"
     for cat in cat_names:
-        total_row += f"<td style='text-align:right'><b>{total_qty_by_cat[cat]:.2f}</b></td><td style='text-align:right'><b>–</b></td>"
+        total_row += f"<td style='text-align:right'><b>{total_qty_by_cat[cat]:.2f}</b></td>"
+
     total_milk_all = float(sum(total_qty_by_cat.values()))
     total_row += f"<td style='text-align:right'><b>{total_milk_all:.2f}</b></td>"
     total_row += f"<td style='text-align:right'><b>{fmt_money(total_sales)}</b></td>"
@@ -3674,7 +3671,23 @@ elif menu == "🧾 Generate Bill":
     else:
         st.dataframe(pay_mode_totals.style.format({"Total (₹)": "₹{:.2f}"}), width="stretch")
 
-    html = build_bill_html(rrow, start_day, end_day, grid, pay_mode_totals, cat_names, opening_due)
+    # --- Print ONLY categories that were purchased (qty > 0 anywhere in the period) ---
+    purchased_cats = []
+    if grid is not None and not grid.empty:
+        for cat in cat_names:
+            qcol = f"{cat} Qty"
+            if qcol not in grid.columns:
+                continue
+            # grid can contain numbers or "-" strings, so coerce safely
+            qty_series = pd.to_numeric(grid[qcol], errors="coerce").fillna(0.0)
+            if (qty_series > 0).any():
+                purchased_cats.append(cat)
+                
+    # If nothing detected (edge case), fallback to original cat_names so bill isn't empty/broken
+    cats_for_print = purchased_cats if purchased_cats else cat_names
+    
+    html = build_bill_html(rrow, start_day, end_day, grid, pay_mode_totals, cats_for_print, opening_due)
+
 
     st.subheader("🖨️ Printable Bill")
     st.components.v1.html(html, height=750, scrolling=True)
