@@ -1,14 +1,12 @@
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime, timedelta
-import os
-import tempfile
+from datetime import date,  timedelta
 import time
-import shutil
 import zipfile
 import io
 import plotly.express as px
-from pandas.errors import EmptyDataError, ParserError
+from supabase import create_client
+
 
 # ================== PAGE CONFIG ==================
 st.set_page_config(page_title="Milk Accounting Pro", layout="wide", initial_sidebar_state="expanded")
@@ -123,8 +121,6 @@ footer {visibility:hidden;}
 </style>
 """, unsafe_allow_html=True)
 
-# ================== STORAGE: SUPABASE ==================
-from supabase import create_client
 
 # Keep same "file names" so your app code doesn't change
 RETAILERS_FILE = "data/retailers.csv"
