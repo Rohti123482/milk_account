@@ -431,9 +431,35 @@ def display_or_dash(v, dash="–") -> str:
     return dash if not s else s
 
 def df_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make df safe for Streamlit (Arrow) display:
+    - convert bytes -> str
+    - ensure object columns are consistent (string)
+    - replace None/NaN with "–"
+    """
     if df is None:
         return pd.DataFrame()
-    return df.replace({None: "–"}).fillna("–")
+
+    out = df.copy()
+
+    # Replace None/NaN first
+    out = out.replace({None: "–"}).fillna("–")
+
+    # Fix Arrow crash: object columns containing mixed bytes/float/etc.
+    for col in out.columns:
+        if out[col].dtype == "object":
+            def _norm(v):
+                if v is None:
+                    return "–"
+                if isinstance(v, (bytes, bytearray)):
+                    try:
+                        return v.decode("utf-8", errors="ignore")
+                    except Exception:
+                        return str(v)
+                return str(v)
+            out[col] = out[col].map(_norm)
+
+    return out
 
 def sb_fetch_all(table: str, cols="*", page_size: int = 1000, max_retries: int = 5):
     sb = get_sb()
