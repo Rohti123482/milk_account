@@ -1,7 +1,7 @@
 import pandas as pd
 import pyarrow as pa
 
-from app import df_for_display
+from core_utils import df_for_display
 
 def test_df_for_display_arrow_safe():
     df = pd.DataFrame({
