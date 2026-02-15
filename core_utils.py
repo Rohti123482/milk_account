@@ -1,27 +1,18 @@
 import pandas as pd
 
+def _fmt_money(x) -> str:
+    try:
+        v = float(x)
+    except Exception:
+        v = 0.0
+    return f"₹{v:,.2f}"
+
+def display_or_dash(v, dash="–") -> str:
+    if v is None:
+        return dash
+    s = str(v).strip()
+    return dash if s == "" or s.lower() in ("nan", "none", "-", "–") else s
+
 def df_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make df safe for Streamlit (Arrow) display.
-    """
-    if df is None:
-        return pd.DataFrame()
-
-    out = df.copy()
-    out = out.replace({None: "–"}).fillna("–")
-
-    for col in out.columns:
-        if out[col].dtype == "object":
-            def _norm(v):
-                if v is None:
-                    return "–"
-                if isinstance(v, (bytes, bytearray)):
-                    try:
-                        return v.decode("utf-8", errors="ignore")
-                    except Exception:
-                        return str(v)
-                return str(v)
-
-            out[col] = out[col].map(_norm)
-
-    return out
+    # keep YOUR existing implementation here (the one you already wrote)
+    return df
