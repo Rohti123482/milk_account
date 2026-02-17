@@ -1439,6 +1439,9 @@ def _day_payments_for_zone(day: date, zone: str) -> pd.DataFrame:
     df = filter_by_zone(df, "retailer_id", zone)
     return df
 
+
+PAYMENT_MODES = ["Cash", "UPI", "Bank", "Cheque", "Other"]
+
 def build_daily_posting_grid(day: date, zone: str, retailers_active: pd.DataFrame, categories_active: pd.DataFrame):
     rz = retailers_active.copy()
     rz["zone"] = rz["zone"].apply(_norm_zone)
@@ -1448,8 +1451,36 @@ def build_daily_posting_grid(day: date, zone: str, retailers_active: pd.DataFram
     cats = categories_active.copy()
     cat_list = cats["name"].tolist()
 
-    day_e = _day_entries_for_zone(day, zone)
+    # --- ALWAYS define these, even if no entries exist ---
     pivot_qty = pd.DataFrame()
+
+    # -------- payments pivot (by mode) ----------
+    day_p = _day_payments_for_zone(day, zone)
+    pay_by_mode = pd.DataFrame()  # IMPORTANT: defined ALWAYS (even if no entries)
+    if not day_p.empty:
+        tmp = day_p.merge(
+            retailers[["retailer_id", "name"]],
+            on="retailer_id",
+            how="left"
+        ).rename(columns={"name": "Retailer"})
+
+        tmp["payment_mode"] = tmp["payment_mode"].fillna("Cash").astype(str)
+        tmp["payment_mode"] = tmp["payment_mode"].str.strip().str.title()
+        tmp["amount"] = pd.to_numeric(tmp["amount"], errors="coerce").fillna(0.0)
+
+        pay_by_mode = (
+            tmp.pivot_table(
+                index="Retailer",
+                columns="payment_mode",
+                values="amount",
+                aggfunc="sum",
+                fill_value=0.0
+            )
+            .reindex(columns=PAYMENT_MODES, fill_value=0.0)
+        )
+
+    # --- entries pivot only if entries exist ---
+    day_e = _day_entries_for_zone(day, zone)
     if not day_e.empty:
         e_view = build_entries_view_cached(day_e, st.session_state["data_version"], want_milk_type_col=False)
         pivot_qty = pd.pivot_table(
@@ -1461,35 +1492,31 @@ def build_daily_posting_grid(day: date, zone: str, retailers_active: pd.DataFram
             fill_value=0.0
         )
 
-    day_p = _day_payments_for_zone(day, zone)
-    pay_map, mode_map = {}, {}
-    if not day_p.empty:
-        tmp = day_p.merge(retailers[["retailer_id", "name"]], on="retailer_id", how="left").rename(columns={"name": "Retailer"})
-        pay_map = tmp.groupby("Retailer")["amount"].sum().to_dict()
-        for rn, sub in tmp.groupby("Retailer"):
-            modes = sub["payment_mode"].dropna().astype(str).unique().tolist()
-            if len(modes) == 1:
-                mode_map[rn] = modes[0]
-            elif len(modes) == 0:
-                mode_map[rn] = "Cash"
-            else:
-                mode_map[rn] = "Mixed"
-
     rows = []
     for _, r in rz.iterrows():
         retailer_name = str(r["name"])
         rid = int(r["retailer_id"])
+
         row = {
             "ID": rid,
             "Retailer": retailer_name,
-            "Today Payment ₹": float(pay_map.get(retailer_name, 0.0)),
-            "Mode": str(mode_map.get(retailer_name, "Cash")),
         }
+
+        # payment columns by mode
+        for m in PAYMENT_MODES:
+            col = f"{m} ₹"
+            val = 0.0
+            if (not pay_by_mode.empty) and (retailer_name in pay_by_mode.index) and (m in pay_by_mode.columns):
+                val = float(pay_by_mode.loc[retailer_name, m])
+            row[col] = float(val)
+
+        # qty columns by category
         for c in cat_list:
             qty = 0.0
-            if not pivot_qty.empty and retailer_name in pivot_qty.index and c in pivot_qty.columns:
+            if (not pivot_qty.empty) and (retailer_name in pivot_qty.index) and (c in pivot_qty.columns):
                 qty = float(pivot_qty.loc[retailer_name, c])
             row[c] = float(qty)
+
         rows.append(row)
 
     grid = pd.DataFrame(rows)
@@ -2090,7 +2117,8 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
         st.warning("No retailers found for selected zone (check retailer zone values).")
         st.stop()
 
-    st.caption("Edit liters + today's payment. Saving overwrites ONLY this date + zone retailers.")
+    st.caption("Edit liters + payments by mode (Cash/UPI/Bank/Cheque/Other). Saving overwrites ONLY this date + zone retailers.")
+
 
     edited = st.data_editor(
         grid_df,
@@ -2118,7 +2146,9 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
         rid = int(row["ID"])
         prev_ledger = retailer_ledger_as_of(rid, prev_day)
         today_sales = compute_today_sales_amount_for_row(rid, posting_date, row, cat_list, categories_active)
-        today_pay = float(row.get("Today Payment ₹", 0.0) or 0.0)
+        today_pay = 0.0
+        for m in PAYMENT_MODES:
+            today_pay += float(row.get(f"{m} ₹", 0.0) or 0.0)
         total_ledger = float(prev_ledger + today_sales - today_pay)
         prev_ledger_list.append(prev_ledger)
         today_sales_list.append(today_sales)
@@ -2197,14 +2227,13 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
                 if next_entry_id is not None:
                     next_entry_id += 1
                 new_entries.append([eid, str(posting_date), rid, cid, float(qty), float(rate), float(amount)])
-
-            pay_amt = float(row.get("Today Payment ₹", 0.0) or 0.0)
-            if pay_amt > 0:
-                mode = str(row.get("Mode", "Cash") or "Cash")
-                pid = None if next_pay_id is None else next_pay_id
-                if next_pay_id is not None:
-                    next_pay_id += 1
-                new_payments.append([pid, str(posting_date), rid, float(pay_amt), mode, "Daily Posting Sheet"])
+            for m in PAYMENT_MODES:
+                pay_amt = float(row.get(f"{m} ₹", 0.0) or 0.0)
+                if pay_amt > 0:
+                    pid = None if next_pay_id is None else next_pay_id
+                    if next_pay_id is not None:
+                        next_pay_id += 1
+                    new_payments.append([pid, str(posting_date), rid, float(pay_amt), m, "Daily Posting Sheet"])
 
 
         if new_entries:
