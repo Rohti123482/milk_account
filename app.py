@@ -2703,6 +2703,53 @@ elif menu == "📝 Daily Entry":
     st.divider()
 
 
+    st.subheader("📅 Daily Business Overview")
+
+    day = st.date_input("Select Day", value=date.today(), key="daily_overview_day_daily_entry")
+
+    dp = dist_purchases.copy()
+    if not dp.empty:
+        dp["date"] = pd.to_datetime(dp["date"], errors="coerce")
+        dp_day = dp.loc[dp["date"].dt.date == day].copy()
+        purchased_qty = float(dp_day["qty"].sum()) if not dp_day.empty else 0.0
+        purchased_amt = float(dp_day["amount"].sum()) if not dp_day.empty else 0.0
+    else:
+        purchased_qty, purchased_amt = 0.0, 0.0
+
+    ez = entries_z.copy()
+    if not ez.empty:
+        ez["date"] = pd.to_datetime(ez["date"], errors="coerce")
+        ez_day = ez.loc[ez["date"].dt.date == day].copy()
+        sold_qty = float(ez_day["qty"].sum()) if not ez_day.empty else 0.0
+        sold_amt = float(ez_day["amount"].sum()) if not ez_day.empty else 0.0
+    else:
+        sold_qty, sold_amt = 0.0, 0.0
+
+    wz = wastage.copy()
+    if not wz.empty:
+        wz["date"] = pd.to_datetime(wz["date"], errors="coerce")
+        wz_day = wz.loc[wz["date"].dt.date == day].copy()
+        waste_qty = float(wz_day["qty"].sum()) if not wz_day.empty else 0.0
+        waste_loss = float(wz_day["estimated_loss"].sum()) if not wz_day.empty else 0.0
+    else:
+        waste_qty, waste_loss = 0.0, 0.0
+
+    net_movement = purchased_qty - sold_qty - waste_qty
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Purchased (L)", f"{purchased_qty:.2f}")
+    c2.metric("Purchase (₹)", f"₹{purchased_amt:.2f}")
+    c3.metric("Sold (L)", f"{sold_qty:.2f}")
+    c4.metric("Sales (₹)", f"₹{sold_amt:.2f}")
+    c5.metric("Wastage (L)", f"{waste_qty:.2f}")
+    c6.metric("Net Movement (L)", f"{net_movement:.2f}")
+
+    if net_movement < 0:
+        st.warning("Net Movement is negative. Purchases might be missing for the day, or you sold from opening stock (not tracked).")
+
+    st.caption("Sales are zone-filtered. Purchases/wastage are not zone-filtered in current model.")
+
+
 
     # ------------------- SAVE ALL -------------------
     if st.button("✅ Save All", type="primary", key="daily_entry_save_all"):
