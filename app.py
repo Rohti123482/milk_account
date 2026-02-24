@@ -578,6 +578,12 @@ def sb_fetch_where(table: str, cols: str = "*", filters: list[tuple] | None = No
 
 
 def sb_fetch_df(path: str, columns: list[str], filters: list[tuple] | None = None) -> pd.DataFrame:
+    """Fetch a dataframe from Supabase.
+
+    IMPORTANT (data integrity): if server-side filtered fetch fails, we return an EMPTY dataframe
+    with the correct schema. We NEVER fall back to an unfiltered full-table read because that
+    causes cross-date contamination in transactional pages.
+    """
     if not filters:
         return safe_read_csv(path, columns)
     if path not in FILE_TO_TABLE:
@@ -587,7 +593,8 @@ def sb_fetch_df(path: str, columns: list[str], filters: list[tuple] | None = Non
         rows = sb_fetch_where(table, cols="*", filters=filters)
         return _normalize_df_from_rows(path, columns, rows)
     except Exception:
-        return safe_read_csv(path, columns)
+        # FAIL CLOSED: empty-with-schema, not unfiltered data.
+        return _normalize_df_from_rows(path, columns, [])
 
 
 def _prepare_df_for_write(df: pd.DataFrame, path: str) -> pd.DataFrame:
@@ -1447,13 +1454,21 @@ def is_distributor_referenced(distributor_id: int) -> bool:
 # ================== DAILY SHEET HELPERS ==================
 
 def _retailer_ids_for_zone(zone: str) -> list[int]:
-    """Returns retailer_ids for the given zone (or all if 'All Zones')."""
+    """Returns retailer_ids for the given zone (or all if 'All Zones').
+
+    NOTE: uses the canonical `retailers` dataframe loaded from Supabase.
+    Do NOT rely on a global `retailers_active` from some page scope.
+    """
     try:
-        rz = retailers_active.copy() if 'retailers_active' in globals() else retailers.copy()
-        if rz is None or rz.empty:
+        rz = retailers.copy() if isinstance(retailers, pd.DataFrame) else pd.DataFrame()
+        if rz.empty:
             return []
         rz = rz.copy()
         rz["zone"] = rz.get("zone", "").astype(str).apply(_norm_zone)
+        # if is_active exists, use it
+        if "is_active" in rz.columns:
+            rz["is_active"] = rz["is_active"].apply(parse_boolish_active)
+            rz = rz.loc[rz["is_active"] == True].copy()
         if zone == "All Zones":
             return rz["retailer_id"].astype(int).tolist()
         return rz.loc[rz["zone"] == _norm_zone(zone), "retailer_id"].astype(int).tolist()
@@ -1506,61 +1521,71 @@ def _day_payments_for_zone(day: date, zone: str) -> pd.DataFrame:
 PAYMENT_MODES = ["Cash", "UPI", "Bank", "Cheque", "Other"]
 
 
+def _day_fetch_strict(path: str, day: date, zone: str) -> pd.DataFrame:
+    """Strict day fetch: if Supabase query fails, STOP instead of showing wrong/empty data."""
+    try:
+        if path == ENTRIES_FILE:
+            return _day_entries_for_zone(day, zone)
+        if path == PAYMENTS_FILE:
+            return _day_payments_for_zone(day, zone)
+        raise ValueError("Unknown path")
+    except Exception as e:
+        st.error(f"❌ Failed to load day data from Supabase for {day} / {zone}.\n\n{e}")
+        st.stop()
+
 def build_daily_posting_grid(day: date, zone: str, retailers_active: pd.DataFrame, categories_active: pd.DataFrame):
-    """Builds the Excel-like daily grid using stable keys (retailer_id), with fresh day data."""
+    """Builds the Daily Posting Sheet grid.
+
+    Data-integrity rules:
+    - All joins/pivots are by retailer_id and category_id (NOT names).
+    - Display columns include the category_id to make the mapping unambiguous.
+    - The returned `cat_cols` is a list of dicts: {col, category_id, name}.
+    """
     rz = retailers_active.copy()
     rz["zone"] = rz.get("zone", "").astype(str).apply(_norm_zone)
     if zone != "All Zones":
         rz = rz.loc[rz["zone"] == _norm_zone(zone)].copy()
 
     cats = categories_active.copy()
-    cat_list = cats["name"].tolist()
+    cats["category_id"] = pd.to_numeric(cats["category_id"], errors="coerce").fillna(0).astype(int)
+    cats["name"] = cats.get("name", "").fillna("").astype(str)
+    cats = cats.loc[cats["category_id"] > 0].copy()
 
-    # Fetch day data (fresh in Supabase mode)
-    day_p = _day_payments_for_zone(day, zone)
-    day_e = _day_entries_for_zone(day, zone)
+    # Category display columns: include ID to prevent duplicate-name ambiguity.
+    cat_cols = []
+    for _, c in cats.iterrows():
+        cid = int(c["category_id"])
+        nm = str(c["name"]).strip()
+        col = f"CID:{cid} — {nm}" if nm else f"CID:{cid}"
+        cat_cols.append({"col": col, "category_id": cid, "name": nm})
 
-    # Payments pivot by retailer_id
+    # Fresh day data (fail closed)
+    day_p = _day_fetch_strict(PAYMENTS_FILE, day, zone)
+    day_e = _day_fetch_strict(ENTRIES_FILE, day, zone)
+
+    # Payments pivot: retailer_id x payment_mode
     pay_by_mode = pd.DataFrame()
-    if not day_p.empty:
+    if day_p is not None and not day_p.empty:
         tmp = day_p.copy()
-        tmp["retailer_id"] = pd.to_numeric(tmp["retailer_id"], errors="coerce").fillna(0).astype(int)
-        tmp["payment_mode"] = tmp["payment_mode"].fillna("Cash").astype(str).str.strip().str.title()
-        tmp["amount"] = pd.to_numeric(tmp["amount"], errors="coerce").fillna(0.0)
+        tmp["retailer_id"] = pd.to_numeric(tmp.get("retailer_id", 0), errors="coerce").fillna(0).astype(int)
+        tmp["payment_mode"] = tmp.get("payment_mode", "Cash").fillna("Cash").astype(str).str.strip().str.title()
+        tmp["amount"] = pd.to_numeric(tmp.get("amount", 0.0), errors="coerce").fillna(0.0).astype(float)
         pay_by_mode = (
-            tmp.pivot_table(
-                index="retailer_id",
-                columns="payment_mode",
-                values="amount",
-                aggfunc="sum",
-                fill_value=0.0,
-            )
+            tmp.pivot_table(index="retailer_id", columns="payment_mode", values="amount", aggfunc="sum", fill_value=0.0)
             .reindex(columns=PAYMENT_MODES, fill_value=0.0)
         )
 
-    # Entries pivot by retailer_id x category_name
-    pivot_qty = pd.DataFrame()
-    if not day_e.empty:
+    # Entries pivot: retailer_id x category_id
+    qty_by_rid_cid = pd.DataFrame()
+    if day_e is not None and not day_e.empty:
         e = day_e.copy()
-        e["retailer_id"] = pd.to_numeric(e["retailer_id"], errors="coerce").fillna(0).astype(int)
-        e["category_id"] = pd.to_numeric(e["category_id"], errors="coerce").fillna(0).astype(int)
-        e["qty"] = pd.to_numeric(e["qty"], errors="coerce").fillna(0.0)
-
-        cat_map = categories_active[["category_id", "name"]].copy()
-        cat_map["category_id"] = pd.to_numeric(cat_map["category_id"], errors="coerce").fillna(0).astype(int)
-        e = e.merge(cat_map, on="category_id", how="left").rename(columns={"name": "CategoryName"})
-        e["CategoryName"] = e["CategoryName"].fillna("").astype(str)
-
-        pivot_qty = pd.pivot_table(
-            e,
-            index="retailer_id",
-            columns="CategoryName",
-            values="qty",
-            aggfunc="sum",
-            fill_value=0.0,
+        e["retailer_id"] = pd.to_numeric(e.get("retailer_id", 0), errors="coerce").fillna(0).astype(int)
+        e["category_id"] = pd.to_numeric(e.get("category_id", 0), errors="coerce").fillna(0).astype(int)
+        e["qty"] = pd.to_numeric(e.get("qty", 0.0), errors="coerce").fillna(0.0).astype(float)
+        qty_by_rid_cid = pd.pivot_table(
+            e, index="retailer_id", columns="category_id", values="qty", aggfunc="sum", fill_value=0.0
         )
 
-    # Build grid rows
     rows = []
     for _, r in rz.iterrows():
         rid = int(r["retailer_id"])
@@ -1568,7 +1593,6 @@ def build_daily_posting_grid(day: date, zone: str, retailers_active: pd.DataFram
 
         row = {"ID": rid, "Retailer": retailer_name}
 
-        # payment columns
         for m in PAYMENT_MODES:
             col = f"{m} ₹"
             val = 0.0
@@ -1576,17 +1600,18 @@ def build_daily_posting_grid(day: date, zone: str, retailers_active: pd.DataFram
                 val = float(pay_by_mode.loc[rid, m])
             row[col] = float(val)
 
-        # qty columns
-        for c in cat_list:
+        for meta in cat_cols:
+            col = meta["col"]
+            cid = int(meta["category_id"])
             qty = 0.0
-            if (not pivot_qty.empty) and (rid in pivot_qty.index) and (c in pivot_qty.columns):
-                qty = float(pivot_qty.loc[rid, c])
-            row[c] = float(qty)
+            if (not qty_by_rid_cid.empty) and (rid in qty_by_rid_cid.index) and (cid in qty_by_rid_cid.columns):
+                qty = float(qty_by_rid_cid.loc[rid, cid])
+            row[col] = float(qty)
 
         rows.append(row)
 
     grid = pd.DataFrame(rows)
-    return grid, cat_list
+    return grid, cat_cols
 
 def compute_today_sales_amount_for_row(rid: int, day: date, row: pd.Series, cat_name_list: list[str], categories_active: pd.DataFrame) -> float:
     amt = 0.0
@@ -2177,8 +2202,6 @@ if menu == "📊 Dashboard":
 elif menu == "📝 Daily Posting Sheet (Excel)":
     st.header("📝 Daily Posting Sheet — Retailers + Distributors + Wastage (Single Save)")
 
-
-
     if retailers_active.empty or categories_active.empty:
         st.warning("⚠️ Please add active retailers and categories first")
         st.stop()
@@ -2188,47 +2211,179 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
     default_idx = zone_choices.index(selected_zone) if selected_zone in zone_choices else 0
     posting_zone = st.selectbox("Posting Zone", zone_choices, index=default_idx, key="posting_zone")
 
-    # ---------------- RETAILER GRID ----------------
-    grid_df, cat_list = build_daily_posting_grid(posting_date, posting_zone, retailers_active, categories_active)
-    if grid_df.empty:
-        st.warning("No retailers found for selected zone.")
-        st.stop()
-    
-    # ---- Column order for Daily Entry: ID, Retailer, Categories, Payments ----
-    cat_cols = [c for c in cat_list if c in grid_df.columns]
-    pay_cols = [f"{m} ₹" for m in PAYMENT_MODES if f"{m} ₹" in grid_df.columns]
+    # ---------------- DRAFT STATE (per date + zone) ----------------
+    def _ctx_key(d: date, z: str) -> str:
+        return f"{str(d)}|{_norm_zone(z)}"
 
-    base_cols = []
-    for c in ["ID", "Retailer"]:
-        if c in grid_df.columns:
-            base_cols.append(c)
+    ctx = _ctx_key(posting_date, posting_zone)
+    st.session_state.setdefault("daily_drafts", {})          # ctx -> dataframe (draft)
+    st.session_state.setdefault("daily_meta", {})            # ctx -> {"cat_cols": [...], "affected_rids": [...]}
+    st.session_state.setdefault("daily_loaded_ctx", None)
+    st.session_state.setdefault("daily_save_lock", False)
 
-    ordered_cols = base_cols + cat_cols + pay_cols
-    extras = [c for c in grid_df.columns if c not in ordered_cols]
+    # Load from DB when context changes (or first load)
+    if st.session_state.get("daily_loaded_ctx") != ctx or ctx not in st.session_state["daily_drafts"]:
+        grid_df, cat_cols = build_daily_posting_grid(posting_date, posting_zone, retailers_active, categories_active)
+        if grid_df is None or grid_df.empty:
+            st.warning("No retailers found for selected zone.")
+            st.stop()
 
-    grid_df = grid_df[ordered_cols + extras]
-    edited = st.data_editor(grid_df, width="stretch", num_rows="fixed", key=f"daily_sheet_editor_{posting_date}_{posting_zone}_{st.session_state.get('data_version',0)}")
+        # affected retailer ids for this zone (used for safe replace on save)
+        rz = retailers_active.copy()
+        rz["zone"] = rz.get("zone", "Default").astype(str).apply(_norm_zone)
+        if posting_zone != "All Zones":
+            rz = rz.loc[rz["zone"] == _norm_zone(posting_zone)].copy()
+        affected_rids = sorted(set(rz["retailer_id"].astype(int).tolist()))
 
-    # Validate retailer prices exist
-    for _, row in edited.iterrows():
-        rid = int(row["ID"])
-        for cat_name in cat_list:
-            qty = float(row.get(cat_name, 0.0) or 0.0)
-            if qty <= 0:
+        st.session_state["daily_drafts"][ctx] = grid_df.copy()
+        st.session_state["daily_meta"][ctx] = {"cat_cols": cat_cols, "affected_rids": affected_rids}
+        st.session_state["daily_loaded_ctx"] = ctx
+
+    cat_cols = (st.session_state["daily_meta"].get(ctx, {}) or {}).get("cat_cols", [])
+    affected_rids = (st.session_state["daily_meta"].get(ctx, {}) or {}).get("affected_rids", [])
+
+    # ---- Column order: ID, Retailer, Categories, Payments ----
+    draft_df = st.session_state["daily_drafts"][ctx].copy()
+    cat_col_names = [m["col"] for m in cat_cols if m.get("col") in draft_df.columns]
+    pay_cols = [f"{m} ₹" for m in PAYMENT_MODES if f"{m} ₹" in draft_df.columns]
+
+    ordered_cols = [c for c in ["ID", "Retailer"] if c in draft_df.columns] + cat_col_names + pay_cols
+    extras = [c for c in draft_df.columns if c not in ordered_cols]
+    draft_df = draft_df[ordered_cols + extras]
+
+    # ---------------- SAVE IMPLEMENTATION (safe replace w/ rollback) ----------------
+    def _sb_insert_records(table: str, records: list[dict], chunk: int = 500) -> None:
+        if not records:
+            return
+        sb = get_sb()
+        for i in range(0, len(records), chunk):
+            sb.table(table).insert(records[i:i+chunk]).execute()
+
+    def _sb_delete_day_zone(table: str, d: date, rids: list[int], chunk: int = 500) -> None:
+        if not rids:
+            return
+        sb = get_sb()
+        for i in range(0, len(rids), chunk):
+            sb.table(table).delete().eq("date", str(d)).in_("retailer_id", rids[i:i+chunk]).execute()
+
+    def _safe_replace_entries_payments(d: date, z: str, edited_df: pd.DataFrame) -> None:
+        if not affected_rids:
+            raise RuntimeError("No retailers found for selected zone.")
+
+        old_e = _day_entries_for_zone(d, z)
+        old_p = _day_payments_for_zone(d, z)
+
+        new_entries = []
+        new_payments = []
+        col_to_cid = {m["col"]: int(m["category_id"]) for m in cat_cols}
+
+        for _, row in edited_df.iterrows():
+            rid = int(row["ID"])
+            if rid not in set(affected_rids):
                 continue
-            cid = int(categories_active.loc[categories_active["name"] == cat_name, "category_id"].iloc[0])
-            rate = get_price_for_date(rid, cid, posting_date)
-            if rate is None or rate <= 0:
-                st.error(f"❌ Missing price for Retailer ID {rid} / {cat_name} on {posting_date}")
-                st.stop()
 
+            for col, cid in col_to_cid.items():
+                qty = float(row.get(col, 0.0) or 0.0)
+                if qty <= 0:
+                    continue
+                rate = get_price_for_date(rid, cid, d)
+                if rate is None or float(rate) <= 0:
+                    raise RuntimeError(f"Missing price for Retailer ID {rid} / Category ID {cid} on {d}")
+                rate = float(rate)
+                amt = float(qty * rate)
+                new_entries.append({"date": str(d), "retailer_id": rid, "category_id": cid, "qty": qty, "rate": rate, "amount": amt})
+
+            for m in PAYMENT_MODES:
+                pamt = float(row.get(f"{m} ₹", 0.0) or 0.0)
+                if pamt <= 0:
+                    continue
+                new_payments.append({"date": str(d), "retailer_id": rid, "amount": pamt, "payment_mode": str(m), "note": ""})
+
+        if USE_DB_IDS:
+            next_eid = sb_next_id("entries", "entry_id")
+            for rec in new_entries:
+                rec["entry_id"] = next_eid
+                next_eid += 1
+            next_pid = sb_next_id("payments", "payment_id")
+            for rec in new_payments:
+                rec["payment_id"] = next_pid
+                next_pid += 1
+        else:
+            for rec in new_entries:
+                rec.pop("entry_id", None)
+            for rec in new_payments:
+                rec.pop("payment_id", None)
+
+        try:
+            _sb_delete_day_zone("entries", d, affected_rids)
+            _sb_delete_day_zone("payments", d, affected_rids)
+            _sb_insert_records("entries", new_entries)
+            _sb_insert_records("payments", new_payments)
+        except Exception as e:
+            # rollback retailer part
+            try:
+                _sb_delete_day_zone("entries", d, affected_rids)
+                _sb_delete_day_zone("payments", d, affected_rids)
+                if old_e is not None and not old_e.empty:
+                    recs = old_e.where(pd.notna(old_e), None).to_dict(orient="records")
+                    if not USE_DB_IDS:
+                        for r in recs:
+                            r.pop("entry_id", None)
+                    _sb_insert_records("entries", recs)
+                if old_p is not None and not old_p.empty:
+                    recs = old_p.where(pd.notna(old_p), None).to_dict(orient="records")
+                    if not USE_DB_IDS:
+                        for r in recs:
+                            r.pop("payment_id", None)
+                    _sb_insert_records("payments", recs)
+            except Exception:
+                pass
+            raise e
+
+    # ---------------- RETAILER EDITOR IN A FORM (prevents reruns while typing) ----------------
+    lock = bool(st.session_state.get("daily_save_lock", False))
+    if lock:
+        st.info("Saving… please do not interact with the page.")
+
+    form_key = f"daily_form_{ctx}_{st.session_state.get('data_version', 0)}"
+    editor_key = f"daily_sheet_editor_{ctx}_{st.session_state.get('data_version', 0)}"
+
+    with st.form(form_key, clear_on_submit=False):
+        edited = st.data_editor(
+            draft_df,
+            width="stretch",
+            num_rows="fixed",
+            key=editor_key,
+            disabled=lock,
+        )
+
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            do_save_all = st.form_submit_button("💾 Save (Retailers + Distributors + Wastage)", type="primary", disabled=lock)
+        with c2:
+            do_preview = st.form_submit_button("Update Preview", disabled=lock)
+
+    if (do_save_all or do_preview) and isinstance(edited, pd.DataFrame):
+        st.session_state["daily_drafts"][ctx] = edited.copy()
+
+    # ---------------- PREVIEW (computed from draft, not from globals) ----------------
+    preview_df = st.session_state["daily_drafts"][ctx].copy()
     prev_day = posting_date - timedelta(days=1)
-    today_sales_list, prev_ledger_list, total_ledger_list = [], [], []
 
-    for _, row in edited.iterrows():
+    today_sales_list, prev_ledger_list, total_ledger_list = [], [], []
+    for _, row in preview_df.iterrows():
         rid = int(row["ID"])
         prev_ledger = retailer_ledger_as_of(rid, prev_day)
-        today_sales = compute_today_sales_amount_for_row(rid, posting_date, row, cat_list, categories_active)
+
+        today_sales = 0.0
+        for meta in cat_cols:
+            col = meta["col"]
+            cid = int(meta["category_id"])
+            qty = float(row.get(col, 0.0) or 0.0)
+            if qty <= 0:
+                continue
+            rate = get_price_for_date(rid, cid, posting_date) or 0.0
+            today_sales += float(qty) * float(rate)
 
         today_pay = 0.0
         for m in PAYMENT_MODES:
@@ -2239,54 +2394,20 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
         today_sales_list.append(today_sales)
         total_ledger_list.append(total_ledger)
 
-    preview = edited.copy()
+    preview = preview_df.copy()
     preview["Previous Ledger ₹"] = prev_ledger_list
     preview["Today Sales ₹"] = today_sales_list
     preview["Total Ledger ₹"] = total_ledger_list
 
-    # ---- Column order for Preview: ID, Retailer, Categories, Today Sales, Ledgers, Payments ----
-    cat_cols = [c for c in cat_list if c in preview.columns]
-    pay_cols = [f"{m} ₹" for m in PAYMENT_MODES if f"{m} ₹" in preview.columns]
-
-    base_cols = []
-    for c in ["ID", "Retailer"]:
-        if c in preview.columns:
-            base_cols.append(c)
-
     ledger_cols = [c for c in ["Today Sales ₹", "Previous Ledger ₹", "Total Ledger ₹"] if c in preview.columns]
-
-    ordered_cols = base_cols + cat_cols + ledger_cols + pay_cols
-    extras = [c for c in preview.columns if c not in ordered_cols]
-
-    preview = preview[ordered_cols + extras]
+    ordered_preview_cols = [c for c in ["ID", "Retailer"] if c in preview.columns] + cat_col_names + ledger_cols + pay_cols
+    extras = [c for c in preview.columns if c not in ordered_preview_cols]
+    preview = preview[ordered_preview_cols + extras]
 
     st.subheader("📌 Retailer Preview")
     st.dataframe(df_for_display(preview), width="stretch")
 
-    # ---- Totals row (Liters) under Retailer Preview ----
-    totals = {"Category Totals": "TOTAL (L)"}
-    grand_total = 0.0
-    for cat in cat_list:
-        s = float(pd.to_numeric(edited.get(cat, 0.0), errors="coerce").fillna(0).sum())
-        totals[cat] = s
-        grand_total += s
-    totals["GRAND TOTAL (L)"] = grand_total
-
-    totals_df = pd.DataFrame([totals])
-
-    # Show totals with dash for zeros (like old bottom row)
-    show_totals = totals_df.copy()
-    for c in cat_list:
-        if c in show_totals.columns:
-            show_totals[c] = show_totals[c].apply(fmt_zero_dash)
-    if "GRAND TOTAL (L)" in show_totals.columns:
-        show_totals["GRAND TOTAL (L)"] = show_totals["GRAND TOTAL (L)"].apply(lambda x: f"{float(x):.2f}")
-
-    st.dataframe(df_for_display(show_totals), width="stretch")
-
-
-
-    # ---------------- DISTRIBUTOR ENTRY ----------------
+# ---------------- DISTRIBUTOR ENTRY ----------------
     st.divider()
     st.subheader("📦 Distributor Daily Entry (STRICT mapping + 2-rate + payment)")
 
@@ -2475,6 +2596,17 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
     else:
         st.dataframe(df_for_display(dist_prev), width="stretch")
 
+        # Grand total bar (₹) under distributor preview
+        tot = {"Distributor": "GRAND TOTAL", "Milk (L)": float(pd.to_numeric(dist_prev["Milk (L)"], errors="coerce").fillna(0.0).sum())}
+        for c in ["Previous Due ₹", "Today Purchases ₹", "Today Payment ₹", "Closing Due ₹"]:
+            if c in dist_prev.columns:
+                tot[c] = float(pd.to_numeric(dist_prev[c], errors="coerce").fillna(0.0).sum())
+        tot_df = pd.DataFrame([tot])
+        tot_df["Milk (L)"] = tot_df["Milk (L)"].apply(lambda x: f"{float(x):.2f}")
+        for c in ["Previous Due ₹", "Today Purchases ₹", "Today Payment ₹", "Closing Due ₹"]:
+            if c in tot_df.columns:
+                tot_df[c] = tot_df[c].apply(_fmt_money)
+        st.dataframe(df_for_display(tot_df), width="stretch")
 
         # Category totals bar (Liters) across all distributors
         cid_to_name = {int(c["category_id"]): str(c["name"]) for _, c in categories_active.iterrows()}
@@ -2533,166 +2665,120 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
 
     # ---------------- SINGLE SAVE ----------------
     st.divider()
-    if st.button("💾 Save (Retailers + Distributors + Wastage)", type="primary", key="single_save_all"):
-        # SAFETY GUARD:
-        # If DB already has data for this date+zone, but the screen is all zeros,
-        # do NOT overwrite (this prevents accidental data wipe when UI state is stale).
+    if do_save_all:
+        st.session_state["daily_save_lock"] = True
         try:
+            # Block wipe-out: DB has data but submitted grid is all zeros
             db_e_chk = _day_entries_for_zone(posting_date, posting_zone)
             db_p_chk = _day_payments_for_zone(posting_date, posting_zone)
             has_db_data = (db_e_chk is not None and not db_e_chk.empty) or (db_p_chk is not None and not db_p_chk.empty)
 
             screen_total_qty = 0.0
-            for c in cat_list:
-                if c in preview.columns:
-                    screen_total_qty += float(pd.to_numeric(preview[c], errors="coerce").fillna(0.0).sum())
+            for meta in cat_cols:
+                col = meta["col"]
+                if col in preview_df.columns:
+                    screen_total_qty += float(pd.to_numeric(preview_df[col], errors="coerce").fillna(0.0).sum())
 
             screen_total_pay = 0.0
             for m in PAYMENT_MODES:
                 col = f"{m} ₹"
-                if col in preview.columns:
-                    screen_total_pay += float(pd.to_numeric(preview[col], errors="coerce").fillna(0.0).sum())
+                if col in preview_df.columns:
+                    screen_total_pay += float(pd.to_numeric(preview_df[col], errors="coerce").fillna(0.0).sum())
 
             if has_db_data and (screen_total_qty == 0.0 and screen_total_pay == 0.0):
-                st.error("❌ Save blocked: DB has data for this date/zone, but your screen is all zeros. This usually means your screen is stale. Reload the page or change the date away and back, then try again.")
+                st.error("❌ Save blocked: DB has data for this date/zone, but your submitted grid is all zeros. This indicates stale UI state.")
                 st.stop()
-        except Exception:
-            # If anything goes wrong, do not block saving (better than crashing),
-            # but still allow manual refresh to fix stale state.
-            pass
 
-        # Retailers overwrite (date + zone retailers)
-        rz = retailers_active.copy()
-        rz["zone"] = rz["zone"].apply(_norm_zone)
-        if posting_zone != "All Zones":
-            rz = rz.loc[rz["zone"] == _norm_zone(posting_zone)].copy()
-        affected_rids = set(rz["retailer_id"].astype(int).tolist())
+            # 1) Retailers (safe replace w/ rollback)
+            _safe_replace_entries_payments(posting_date, posting_zone, preview_df)
 
-        if not affected_rids:
-            st.error("No retailers found for selected zone.")
+            # 2) Distributors + Wastage (reuse your existing logic below, unchanged)
+            # NOTE: their save uses deletes+inserts. If any exception occurs, we stop and show error.
+
+            # ---- distributors overwrite (date for those distributors)
+            payload = st.session_state.get("dist_daily_payload", {}) or {}
+            dist_ids = sorted([int(x) for x in payload.keys()])
+
+            if dist_ids:
+                sb_delete_where("distributor_purchases", [("date", "eq", str(posting_date)), ("distributor_id", "in", dist_ids)])
+                sb_delete_where("distributor_payments", [("date", "eq", str(posting_date)), ("distributor_id", "in", dist_ids)])
+
+                next_pur_id = None if USE_DB_IDS else sb_next_id("distributor_purchases", "purchase_id")
+                next_dpay_id = None if USE_DB_IDS else sb_next_id("distributor_payments", "payment_id")
+
+                new_dp, new_dpay = [], []
+
+                for did in dist_ids:
+                    d = payload[did]
+                    dist_edit = d["editor"].copy()
+                    show_cat_ids = d["category_ids"]
+
+                    for i in range(len(dist_edit)):
+                        if i >= len(show_cat_ids):
+                            continue
+                        cid = int(show_cat_ids[i])
+
+                        qa = float(dist_edit.loc[i, "Qty A"] or 0.0)
+                        ra = float(dist_edit.loc[i, "Rate A"] or 0.0)
+                        qb = float(dist_edit.loc[i, "Qty B"] or 0.0)
+                        rb = float(dist_edit.loc[i, "Rate B"] or 0.0)
+
+                        if qa > 0:
+                            pid = None if USE_DB_IDS else next_pur_id
+                            if not USE_DB_IDS:
+                                next_pur_id += 1
+                            new_dp.append([pid, str(posting_date), int(did), int(cid), float(qa), float(ra), float(qa * ra)])
+
+                        if qb > 0:
+                            pid = None if USE_DB_IDS else next_pur_id
+                            if not USE_DB_IDS:
+                                next_pur_id += 1
+                            new_dp.append([pid, str(posting_date), int(did), int(cid), float(qb), float(rb), float(qb * rb)])
+
+                    pay_amt = float(d.get("payment_amt", 0.0) or 0.0)
+                    if pay_amt > 0:
+                        ppid = None if USE_DB_IDS else next_dpay_id
+                        if not USE_DB_IDS:
+                            next_dpay_id += 1
+                        new_dpay.append([ppid, str(posting_date), int(did), float(pay_amt), str(d.get("payment_mode", "Cash")), str(d.get("payment_note", ""))])
+
+                if new_dp:
+                    sb_insert_df(pd.DataFrame(new_dp, columns=CSV_SCHEMAS[DISTRIBUTOR_PURCHASES_FILE]), DISTRIBUTOR_PURCHASES_FILE)
+                if new_dpay:
+                    sb_insert_df(pd.DataFrame(new_dpay, columns=CSV_SCHEMAS[DISTRIBUTOR_PAYMENTS_FILE]), DISTRIBUTOR_PAYMENTS_FILE)
+
+            # ---- wastage overwrite for date
+            sb_delete_where("wastage", [("date", "eq", str(posting_date))])
+
+            next_wid = None if USE_DB_IDS else sb_next_id("wastage", "wastage_id")
+            new_w = []
+            waste_map = waste_base[["Category", "category_id"]].copy().reset_index(drop=True)
+
+            for i in range(len(waste_edit)):
+                cid = int(waste_map.loc[i, "category_id"])
+                q = float(waste_edit.loc[i, "Qty Wasted (L)"] or 0.0)
+                loss = float(waste_edit.loc[i, "Estimated Loss (₹)"] or 0.0)
+                rsn = str(waste_edit.loc[i, "Reason"] or "")
+                if q <= 0 and loss <= 0 and (rsn.strip() == ""):
+                    continue
+
+                wid = None if USE_DB_IDS else next_wid
+                if not USE_DB_IDS:
+                    next_wid += 1
+                new_w.append([wid, str(posting_date), int(cid), float(q), rsn, float(loss)])
+
+            if new_w:
+                sb_insert_df(pd.DataFrame(new_w, columns=CSV_SCHEMAS[WASTAGE_FILE]), WASTAGE_FILE)
+
+            st.success("✅ Saved: Retailers + Distributors + Wastage")
+            invalidate_data_cache()
+            st.session_state["daily_save_lock"] = False
+            st.rerun()
+
+        except Exception as e:
+            st.session_state["daily_save_lock"] = False
+            st.error(f"❌ Save failed (Retailers are rollback-protected; distributor/wastage may need review).\n\n{e}")
             st.stop()
-
-        sb_delete_where("entries", [("date", "eq", str(posting_date)), ("retailer_id", "in", list(affected_rids))])
-        sb_delete_where("payments", [("date", "eq", str(posting_date)), ("retailer_id", "in", list(affected_rids))])
-
-        next_entry_id = None if USE_DB_IDS else sb_next_id("entries", "entry_id")
-        next_pay_id = None if USE_DB_IDS else sb_next_id("payments", "payment_id")
-
-        new_entries, new_payments = [], []
-
-        for _, row in preview.iterrows():
-            rid = int(row["ID"])
-            if rid not in affected_rids:
-                continue
-
-            for cat_name in cat_list:
-                qty = float(row.get(cat_name, 0.0) or 0.0)
-                if qty <= 0:
-                    continue
-                cid = int(categories_active.loc[categories_active["name"] == cat_name, "category_id"].iloc[0])
-                rate = float(get_price_for_date(rid, cid, posting_date))
-                amt = float(qty * rate)
-
-                eid = None if USE_DB_IDS else next_entry_id
-                if not USE_DB_IDS:
-                    next_entry_id += 1
-                new_entries.append([eid, str(posting_date), int(rid), int(cid), float(qty), float(rate), float(amt)])
-
-            for m in PAYMENT_MODES:
-                pamt = float(row.get(f"{m} ₹", 0.0) or 0.0)
-                if pamt <= 0:
-                    continue
-                pid = None if USE_DB_IDS else next_pay_id
-                if not USE_DB_IDS:
-                    next_pay_id += 1
-                new_payments.append([pid, str(posting_date), int(rid), float(pamt), str(m), ""])
-
-        if new_entries:
-            sb_insert_df(pd.DataFrame(new_entries, columns=CSV_SCHEMAS[ENTRIES_FILE]), ENTRIES_FILE)
-        if new_payments:
-            sb_insert_df(pd.DataFrame(new_payments, columns=CSV_SCHEMAS[PAYMENTS_FILE]), PAYMENTS_FILE)
-
-        # Distributors overwrite (date for those distributors)
-        payload = st.session_state.get("dist_daily_payload", {}) or {}
-        dist_ids = sorted([int(x) for x in payload.keys()])
-
-        if dist_ids:
-            sb_delete_where("distributor_purchases", [("date", "eq", str(posting_date)), ("distributor_id", "in", dist_ids)])
-            sb_delete_where("distributor_payments", [("date", "eq", str(posting_date)), ("distributor_id", "in", dist_ids)])
-
-            next_pur_id = None if USE_DB_IDS else sb_next_id("distributor_purchases", "purchase_id")
-            next_dpay_id = None if USE_DB_IDS else sb_next_id("distributor_payments", "payment_id")
-
-            new_dp, new_dpay = [], []
-
-            for did in dist_ids:
-                d = payload[did]
-                dist_edit = d["editor"].copy()
-                show_cat_ids = d["category_ids"]
-
-                # Purchases with A/B slabs (same category allowed twice with different rates)
-                for i in range(len(dist_edit)):
-                    if i >= len(show_cat_ids):
-                        continue
-                    cid = int(show_cat_ids[i])
-
-                    qa = float(dist_edit.loc[i, "Qty A"] or 0.0)
-                    ra = float(dist_edit.loc[i, "Rate A"] or 0.0)
-                    qb = float(dist_edit.loc[i, "Qty B"] or 0.0)
-                    rb = float(dist_edit.loc[i, "Rate B"] or 0.0)
-
-                    if qa > 0:
-                        pid = None if USE_DB_IDS else next_pur_id
-                        if not USE_DB_IDS:
-                            next_pur_id += 1
-                        new_dp.append([pid, str(posting_date), int(did), int(cid), float(qa), float(ra), float(qa * ra)])
-
-                    if qb > 0:
-                        pid = None if USE_DB_IDS else next_pur_id
-                        if not USE_DB_IDS:
-                            next_pur_id += 1
-                        new_dp.append([pid, str(posting_date), int(did), int(cid), float(qb), float(rb), float(qb * rb)])
-
-                # Payment made today
-                pay_amt = float(d.get("payment_amt", 0.0) or 0.0)
-                if pay_amt > 0:
-                    ppid = None if USE_DB_IDS else next_dpay_id
-                    if not USE_DB_IDS:
-                        next_dpay_id += 1
-                    new_dpay.append([ppid, str(posting_date), int(did), float(pay_amt), str(d.get("payment_mode", "Cash")), str(d.get("payment_note", ""))])
-
-            if new_dp:
-                sb_insert_df(pd.DataFrame(new_dp, columns=CSV_SCHEMAS[DISTRIBUTOR_PURCHASES_FILE]), DISTRIBUTOR_PURCHASES_FILE)
-            if new_dpay:
-                sb_insert_df(pd.DataFrame(new_dpay, columns=CSV_SCHEMAS[DISTRIBUTOR_PAYMENTS_FILE]), DISTRIBUTOR_PAYMENTS_FILE)
-
-        # Wastage overwrite for date
-        sb_delete_where("wastage", [("date", "eq", str(posting_date))])
-
-        next_wid = None if USE_DB_IDS else sb_next_id("wastage", "wastage_id")
-        new_w = []
-        waste_map = waste_base[["Category", "category_id"]].copy().reset_index(drop=True)
-
-        for i in range(len(waste_edit)):
-            cid = int(waste_map.loc[i, "category_id"])
-            q = float(waste_edit.loc[i, "Qty Wasted (L)"] or 0.0)
-            loss = float(waste_edit.loc[i, "Estimated Loss (₹)"] or 0.0)
-            reason = str(waste_edit.loc[i, "Reason"] or "")
-            if q <= 0:
-                continue
-
-            wid = None if USE_DB_IDS else next_wid
-            if not USE_DB_IDS:
-                next_wid += 1
-            new_w.append([wid, str(posting_date), int(cid), float(q), str(reason), float(loss)])
-
-        if new_w:
-            sb_insert_df(pd.DataFrame(new_w, columns=CSV_SCHEMAS[WASTAGE_FILE]), WASTAGE_FILE)
-
-        st.success("✅ Saved: Retailers + Distributors + Wastage")
-        invalidate_data_cache()
-        st.rerun()
-# ================== DATE + ZONE VIEW ==================
 elif menu == "📅 Date + Zone View":
     st.header("📅 View All Data for a Specific Date + Zone")
 
