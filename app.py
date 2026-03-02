@@ -171,43 +171,25 @@ if st.sidebar.button("🔌 Test DB Connection"):
         sb.table("retailers").select("retailer_id").limit(1).execute()
         st.sidebar.success("Supabase connected ✅")
     except Exception as e:
-        st.sidebar.error(f"Connection failed ❌\n{e}")# Session-state init (safe under reruns)
-if "data_version" not in st.session_state:
-    st.session_state["data_version"] = 0
-if "table_versions" not in st.session_state or not isinstance(st.session_state.get("table_versions"), dict):
-    st.session_state["table_versions"] = {}
-
-
+        st.sidebar.error(f"Connection failed ❌\n{e}")
 
 
 
 # ================== CACHE INVALIDATION (PERFORMANCE) ==================
-def invalidate_data_cache(tables: list[str] | None = None) -> None:
-    """Invalidate cached DB reads after writes.
-
-    Performance goal:
-    - Avoid nuking *all* Streamlit caches on every write.
-    - Bump a global data_version (used by editor keys and broad caches),
-      and bump per-table versions so only affected tables re-fetch.
-    """
-    # global bump (keeps editor keys safe)
+def invalidate_data_cache() -> None:
+    """Force the UI to reload fresh data after any write/delete."""
+    # 1) bump version (used by editor keys + cached wrappers)
     st.session_state["data_version"] = int(st.session_state.get("data_version", 0)) + 1
 
-    # per-table bump
-    tv = st.session_state.get("table_versions")
-    if not isinstance(tv, dict):
-        tv = {}
-        st.session_state["table_versions"] = tv
-
-    if tables:
-        for t in tables:
-            t = str(t)
-            tv[t] = int(tv.get(t, 0)) + 1
-    else:
-        # If caller didn't specify, assume transactional tables were affected.
-        # (We keep it broad but still avoid clearing unrelated cached functions.)
-        for t in FILE_TO_TABLE.values():
-            tv[t[0]] = int(tv.get(t[0], 0)) + 1
+    # 2) clear Streamlit caches (important when DB changes)
+    try:
+        load_and_migrate_data_cached.clear()  # type: ignore[name-defined]
+    except Exception:
+        pass
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 
 
@@ -486,7 +468,7 @@ def df_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
-def sb_fetch_all(table: str, cols="*", page_size: int = 5000, max_retries: int = 5):
+def sb_fetch_all(table: str, cols="*", page_size: int = 1000, max_retries: int = 5):
     sb = get_sb()
     out = []
     offset = 0
@@ -514,18 +496,6 @@ def sb_fetch_all(table: str, cols="*", page_size: int = 5000, max_retries: int =
             raise last_exc
 
 
-
-@st.cache_data(show_spinner=False)
-def sb_fetch_all_cached(table: str, cols: str, page_size: int, data_version: int, table_version: int) -> list[dict]:
-    """Cached full-table fetch.
-
-    Cache keys:
-      - data_version: broad invalidate for UI/editor safety
-      - table_version: targeted invalidate when only one table changes
-    """
-    _ = int(data_version)
-    _ = int(table_version)
-    return sb_fetch_all(table, cols=cols, page_size=page_size)
 
 def _normalize_df_from_rows(path: str, columns: list[str], rows: list[dict]) -> pd.DataFrame:
     if not rows:
@@ -706,7 +676,7 @@ def sb_insert_df(df: object, path: str) -> None:
 
     # Persist snapshot + refresh caches
     safe_write_csv(df, path, allow_empty=False)
-    invalidate_data_cache([table])
+    invalidate_data_cache()
 
 
 def sb_delete_by_pk(table: str, pk: str, ids: list[int], chunk: int = 500) -> None:
@@ -717,7 +687,7 @@ def sb_delete_by_pk(table: str, pk: str, ids: list[int], chunk: int = 500) -> No
     for i in range(0, len(ids), chunk):
         sb.table(table).delete().in_(pk, ids[i:i+chunk]).execute()
 
-    invalidate_data_cache([table])
+    invalidate_data_cache()
 
 
 
@@ -752,7 +722,7 @@ def sb_delete_where(table: str, filters: list[tuple], in_chunk: int = 500) -> No
 
     if not in_filters:
         base.execute()
-        invalidate_data_cache([table])
+        invalidate_data_cache()
         return
 
     first_col, first_vals = in_filters[0]
@@ -764,7 +734,7 @@ def sb_delete_where(table: str, filters: list[tuple], in_chunk: int = 500) -> No
             q = q.in_(col, vals)
         q.execute()
 
-    invalidate_data_cache([table])
+    invalidate_data_cache()
 
 def safe_write_csv(df: pd.DataFrame, path: str, allow_empty: bool = False) -> None:
     """
@@ -794,7 +764,7 @@ def safe_write_csv(df: pd.DataFrame, path: str, allow_empty: bool = False) -> No
         chunk = 500
         for i in range(0, len(records), chunk):
             sb.table(table).insert(records[i:i+chunk]).execute()
-        invalidate_data_cache([table])
+        invalidate_data_cache()
         return
 
     # Mixed NULL/non-NULL PK is dangerous (can create duplicates).
@@ -814,7 +784,7 @@ def safe_write_csv(df: pd.DataFrame, path: str, allow_empty: bool = False) -> No
     for i in range(0, len(records), chunk):
         sb.table(table).upsert(records[i:i+chunk], on_conflict=pk).execute()
 
-    invalidate_data_cache([table])
+    invalidate_data_cache()
 
 
 def safe_write_two_csvs(df1: pd.DataFrame, path1: str, df2: pd.DataFrame, path2: str) -> None:
@@ -828,25 +798,14 @@ def safe_read_csv(path: str, columns: list[str]) -> pd.DataFrame:
     DB MODE:
     - Reads from Supabase tables (NOT local CSV).
     - Returns a DataFrame with exactly the expected schema columns (plus allowed legacy missing columns).
-
-    Performance:
-    - Uses a cached, paginated fetch per-table.
-    - Cache invalidation is targeted via table_versions when possible.
     """
     if path not in FILE_TO_TABLE:
+        # fallback: return empty with the requested columns
         return pd.DataFrame(columns=columns)
 
-    table, _pk = FILE_TO_TABLE[path]
+    table, pk = FILE_TO_TABLE[path]
 
-    data_version = int(st.session_state.get("data_version", 0))
-    tv = st.session_state.get("table_versions", {})
-    table_version = int(tv.get(table, 0)) if isinstance(tv, dict) else 0
-
-    # Fetch only the columns we know about. Still uses '*' internally if you want,
-    # but schema columns are safer for large tables.
-    cols = "*"
-    rows = sb_fetch_all_cached(table, cols=cols, page_size=5000, data_version=data_version, table_version=table_version)
-
+    rows = sb_fetch_all(table, cols="*")
     if not rows:
         df = pd.DataFrame(columns=columns)
     else:
@@ -863,8 +822,12 @@ def safe_read_csv(path: str, columns: list[str]) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = None
 
+    # Keep only schema columns (and legacy allowed ones if they are in schema)
     keep = [c for c in columns if c in df.columns]
-    return df[keep].copy()
+    df = df[keep].copy()
+
+    return df
+
 
 def distributor_balance_before(distributor_id: int, start_day: date) -> float:
     """
@@ -1270,221 +1233,173 @@ def build_distributor_bill_html(
 """
     return html
 
-
-
-
 def build_daily_report_html(
-    report_day: date,
-    retailer_table: pd.DataFrame,
-    retailer_totals: dict,
-    retailer_pay_modes: pd.DataFrame,
-    distributor_table: pd.DataFrame,
-    distributor_totals: dict,
-    purchased_qty: float,
-    purchased_amt: float,
-    sold_qty: float,
-    sold_amt: float,
-    waste_qty: float = 0.0,
-    waste_loss: float = 0.0,
-) -> str:
-    """Print-ready HTML daily report (no Excel dependency)."""
+    report_day,
+    retailer_table,
+    retailer_totals,
+    retailer_pay_modes,
+    distributor_table,
+    distributor_totals,
+    purchased_qty,
+    purchased_amt,
+    sold_qty,
+    sold_amt,
+    waste_qty=0.0,
+    waste_loss=0.0,
+):
 
-    def esc(s: str) -> str:
-        return (
-            str(s)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-        )
+    import pandas as pd
 
-    def fmt_num(x) -> str:
+    def esc(x):
+        if pd.isna(x):
+            return ""
+        return str(x)
+
+    def fmt_num(x):
         try:
             return f"{float(x):.2f}"
-        except Exception:
+        except:
             return "0.00"
 
-    def fmt_money(x) -> str:
+    def fmt_money(x):
         try:
             return f"₹{float(x):,.2f}"
-        except Exception:
+        except:
             return "₹0.00"
 
-    def df_to_html_table(df: pd.DataFrame, title: str) -> str:
+    def df_to_html(df, title):
         if df is None or df.empty:
-            return f"<h3>{esc(title)}</h3><div class='muted'>No data.</div>"
+            return f"<h3>{title}</h3><p>No data</p>"
 
-        cols = list(df.columns)
+        head = "".join(f"<th>{c}</th>" for c in df.columns)
 
-        def is_num_col(c: str) -> bool:
-            c = str(c)
-            return ("₹" in c) or ("(₹)" in c) or ("(L)" in c) or ("TOTAL" in c.upper())
-
-        thead = "".join([f"<th>{esc(c)}</th>" for c in cols])
-        rows_html = []
+        rows = ""
         for _, r in df.iterrows():
-            name_val = str(r.get(cols[0], "")).strip() if cols else ""
-            row_cls = ""
-            if name_val.upper() == "GRAND TOTAL":
-                row_cls = "total-row"
-            elif name_val in ["—", "-", "–"]:
-                row_cls = "divider-row"
-
-            tds = []
-            for c in cols:
-                val = r.get(c, "")
-                td_cls = "num" if is_num_col(c) else ""
-                tds.append(f"<td class='{td_cls}'>{esc(val)}</td>")
-            rows_html.append(f"<tr class='{row_cls}'>{''.join(tds)}</tr>")
-
-        tbody = "".join(rows_html)
+            rows += "<tr>" + "".join(
+                f"<td>{esc(r[c])}</td>" for c in df.columns
+            ) + "</tr>"
 
         return f"""
-        <div class="section-title">{esc(title)}</div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr>{thead}</tr></thead>
-            <tbody>{tbody}</tbody>
-          </table>
-        </div>
+        <h3>{title}</h3>
+        <table>
+            <thead><tr>{head}</tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
         """
-    rt = retailer_totals or {}
-    dt = distributor_totals or {}
-
-    pay_modes_html = ""
-    if retailer_pay_modes is not None and (not retailer_pay_modes.empty):
-        pm = retailer_pay_modes.copy()
-        if "Total (₹)" in pm.columns:
-            pm["Total (₹)"] = pm["Total (₹)"].apply(fmt_money)
-        pay_modes_html = df_to_html_table(pm, "Payments by Mode")
-    else:
-        pay_modes_html = "<h3>Payments by Mode</h3><div class='muted'>No payments.</div>"
 
     net_profit = float(sold_amt) - float(purchased_amt) - float(waste_loss)
-    from datetime import datetime
-    header_day = report_day.strftime("%d %b %Y")
 
-    return f"""<!doctype html>
+    summary_cards = f"""
+    <div class="cards">
+        <div class="card"><b>Purchased</b><br>{fmt_num(purchased_qty)} L</div>
+        <div class="card"><b>Purchase Amt</b><br>{fmt_money(purchased_amt)}</div>
+        <div class="card"><b>Sold</b><br>{fmt_num(sold_qty)} L</div>
+        <div class="card"><b>Sales</b><br>{fmt_money(sold_amt)}</div>
+        <div class="card"><b>Wastage</b><br>{fmt_num(waste_qty)} L</div>
+        <div class="card"><b>Net Profit</b><br>{fmt_money(net_profit)}</div>
+    </div>
+    """
+
+    html = f"""
+<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>JYOTIRLING MILK SUPPLIERS - Daily Statement - {esc(header_day)}</title>
-  <style>
-    :root {{ --text:#0f172a; --muted:#475569; --line:#e2e8f0; --bg:#ffffff; --chip:#f1f5f9; }}
-    * {{ box-sizing:border-box; }}
-    body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; background:var(--bg); color:var(--text); margin:0; padding:24px; }}
-    .wrap {{ max-width: 100%; margin:0 auto; }}
-    .top {{ display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:14px; }}
-    .brand h1 {{ margin:0; font-size:18px; letter-spacing:.6px; text-transform:uppercase; }}
-    .brand .muted {{ color:var(--muted); font-size:12px; margin-top:2px; }}
-    .chip {{ display:inline-block; padding:6px 10px; border-radius:999px; background:var(--chip); font-weight:700; font-size:12px; }}
-    .grid {{ display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:10px; margin:14px 0 18px; }}
-    .card {{ border:1px solid var(--line); border-radius:12px; padding:12px; }}
-    .card .k {{ color:var(--muted); font-size:12px; font-weight:700; }}
-    .card .v {{ font-size:16px; font-weight:900; margin-top:4px; }}
-    h3 {{ margin:16px 0 8px; font-size:14px; }}
-    .muted {{ color:var(--muted); font-size:12px; }}
-.title {{ font-size:13px; font-weight:800; margin-top:4px; }}
-.small {{ font-size:11px; }}
-    .section-title {{ font-size:15px; font-weight:900; margin-top:22px; margin-bottom:8px; border-bottom:2px solid #000; padding-bottom:4px; }}
-table th:first-child, table td:first-child {{ text-align:left; width: 220px; }}
-td.num {{ text-align:right; }}
-tr.total-row td {{ font-weight:900; background:#f1f5f9; }}
-tr.divider-row td {{ color:#64748b; text-align:center; font-weight:800; }}
-@page {{ size: A4 landscape; margin: 10mm; }}
-@media print {{
-  body {{ padding:0; }}
-  .grid {{ break-inside: avoid; }}
-  .table-wrap {{ border:none; }}
-  .card {{ break-inside: avoid; }}
+<meta charset="utf-8">
+<title>Milk Report</title>
 
-  /* Keep table headers repeating and prevent ugly row splits */
-  thead {{ display: table-header-group; }}
-  tfoot {{ display: table-footer-group; }}
-  tr {{ break-inside: avoid; page-break-inside: avoid; }}
+<style>
 
-  /* Tighten table for print */
-  table th:first-child, table td:first-child {{ width: 180px; }}
-  thead th, tbody td {{ font-size:10px; padding:5px 4px; }}
-  td.num {{ white-space: nowrap; }}
+body {{
+    font-family: Arial;
+    margin:20px;
 }}
-    .table-wrap {{ border:1px solid var(--line); border-radius:12px; overflow:hidden; }}
-    table {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
-    thead th {{ background:#f8fafc; border-bottom:1px solid var(--line); text-align:center; font-size:11px; padding:8px; word-wrap:break-word; }}
-    tbody td {{ border-top:1px solid var(--line); padding:7px 6px; font-size:11px; text-align:center; word-wrap:break-word; }}
-    .totals {{ margin-top:10px; display:flex; flex-wrap:wrap; gap:10px; }}
-    .totals .pill {{ border:1px solid var(--line); border-radius:999px; padding:8px 10px; font-size:12px; }}
-    .hr {{ height:1px; background:var(--line); margin:18px 0; }}
-    @media print {{ body {{ padding:0; }} .table-wrap {{ border:none; }} .card {{ break-inside:avoid; }} }}
-  
-  .btns {{ margin: 10px 0 14px 0; }}
-  .print-btn {{ background:#111; color:#fff; border:none; padding:10px 18px; font-weight:800; border-radius:10px; cursor:pointer; font-size:13px; }}
-  .print-btn:hover {{ background:#333; }}
-  @media print {{ .btns {{ display: none; }} }}
+
+.header {{
+    text-align:center;
+}}
+
+.cards {{
+    display:flex;
+    justify-content:space-between;
+    margin-top:20px;
+    flex-wrap:wrap;
+}}
+
+.card {{
+    flex:1;
+    min-width:160px;
+    margin:5px;
+    padding:10px;
+    border:1px solid #000;
+    text-align:center;
+    font-size:13px;
+}}
+
+table {{
+    width:100%;
+    border-collapse:collapse;
+    margin-top:10px;
+    font-size:12px;
+}}
+
+th, td {{
+    border:1px solid #000;
+    padding:5px;
+    text-align:center;
+}}
+
+th {{
+    background:#f0f0f0;
+}}
+
+.section {{
+    margin-top:25px;
+}}
+
+.print-btn {{
+    margin-bottom:15px;
+}}
+
+@media print {{
+    .print-btn {{
+        display:none;
+    }}
+}}
+
 </style>
 </head>
+
 <body>
-<div class="btns">
-  <button class="print-btn" onclick="window.print()">🖨 Print Statement</button>
+
+<div class="print-btn">
+<button onclick="window.print()">Print Report</button>
 </div>
 
-  <div class="wrap">
-    <div class="top">
-      <div class="brand">
-        <h1>JYOTIRLING MILK SUPPLIERS</h1>
-        <div class="title">Daily Statement Summary</div>
-        <div class="muted">Milk Sales, Payments, Distributor Purchases & Ledgers</div>
-        <div class="muted small">All figures are as per entries recorded in the system.</div>
-      </div>
-      <div style="text-align:right;">
-        <div class="muted" style="font-weight:800;">Statement Date</div>
-        <div class="chip">{esc(header_day)}</div>
-        <div class="muted small" style="margin-top:6px;">Generated: {esc(datetime.now().strftime("%d %b %Y, %I:%M %p"))}</div>
-      </div>
-    </div>
+<div class="header">
+<h2>JYOTIRLING MILK SUPPLIERS</h2>
+<h4>Daily Business Summary</h4>
+<p>Date: {report_day}</p>
+</div>
 
-    <div class="grid">
-      <div class="card"><div class="k">Purchased (L)</div><div class="v">{fmt_num(purchased_qty)}</div></div>
-      <div class="card"><div class="k">Purchase (₹)</div><div class="v">{fmt_money(purchased_amt)}</div></div>
-      <div class="card"><div class="k">Sold (L)</div><div class="v">{fmt_num(sold_qty)}</div></div>
-      <div class="card"><div class="k">Sales (₹)</div><div class="v">{fmt_money(sold_amt)}</div></div>
-    </div>
+{summary_cards}
 
-    <div class="grid">
-      <div class="card"><div class="k">Wastage (L)</div><div class="v">{fmt_num(waste_qty)}</div></div>
-      <div class="card"><div class="k">Wastage Loss (₹)</div><div class="v">{fmt_money(waste_loss)}</div></div>
-      <div class="card"><div class="k">Net Profit (₹)</div><div class="v">{fmt_money(net_profit)}</div></div>
-      <div class="card"><div class="k">Note</div><div class="v" style="font-size:12px; font-weight:800; color:var(--muted);">Profit excludes other expenses unless recorded.</div></div>
-    </div>
+<div class="section">
+{df_to_html(retailer_table, "Retailers / Zones Summary")}
+</div>
 
-    {df_to_html_table(retailer_table, "Retailers / Zones Summary")}
+<div class="section">
+{df_to_html(retailer_pay_modes, "Payments by Mode")}
+</div>
 
-    <div class="totals">
-      <div class="pill"><b>Retailer GRAND TOTAL Milk</b>: {fmt_num(rt.get('total_milk', 0.0))} L</div>
-      <div class="pill"><b>Retailer GRAND TOTAL Sales</b>: {fmt_money(rt.get('sales_amt', 0.0))}</div>
-      <div class="pill"><b>Retailer Payments</b>: {fmt_money(rt.get('paid_amt', 0.0))}</div>
-      <div class="pill"><b>Retailer Ledger (Close)</b>: {fmt_money(rt.get('closing_ledger', 0.0))}</div>
-    </div>
+<div class="section">
+{df_to_html(distributor_table, "Distributor Summary")}
+</div>
 
-    {pay_modes_html}
-
-    <div class="hr"></div>
-
-    {df_to_html_table(distributor_table, "Distributors Summary")}
-
-    <div class="totals">
-      <div class="pill"><b>Distributor GRAND TOTAL Milk</b>: {fmt_num(dt.get('total_milk', 0.0))} L</div>
-      <div class="pill"><b>Distributor GRAND TOTAL Purchase</b>: {fmt_money(dt.get('purchase_amt', 0.0))}</div>
-      <div class="pill"><b>Distributor Paid</b>: {fmt_money(dt.get('paid_amt', 0.0))}</div>
-      <div class="pill"><b>Distributor Ledger (Close)</b>: {fmt_money(dt.get('closing_ledger', 0.0))}</div>
-    </div>
-
-  </div>
 </body>
 </html>
 """
 
+    return html
 # ================== LOAD DATA ==================
 def load_and_migrate_data():
     retailers = safe_read_csv(RETAILERS_FILE, CSV_SCHEMAS[RETAILERS_FILE])
@@ -2340,6 +2255,7 @@ def build_bill_html(
 def bill_pdf_bytes_from_html(html: str):
     return None
 
+
 # ================== SIDEBAR: ZONE CONTEXT ==================
 zones = get_all_zones()
 if MAIN_ZONE not in zones:
@@ -2397,14 +2313,13 @@ menu = st.sidebar.radio(
         "🥛 Milk Categories",
         "🏪 Retailers",
         "💰 Price Management",
+        "🧾 Retailers Bill",
         "📒 Ledger",
         "🔍 Filters & Reports",
         "🚚 Distributors",
         "📒 Distributor Ledger",
         "🧾 Distributor Bill",
-        "🗑️ Milk Wastage",
         "💼 Expenses",
-        "🧾 Generate Bill",
         "🛡️ Data Health & Backup",
     ],
 )
@@ -2429,242 +2344,6 @@ if menu == "📊 Dashboard":
 
     st.divider()
 
-    st.subheader("📅 Daily Summary Sheet (Zone totals + Main retailers)")
-    dash_day = st.date_input("Select Date", value=date.today(),key="dash_day_overview")
-
-    # Categories (active only)
-    cat_df = categories.copy()
-    if not cat_df.empty and "is_active" in cat_df.columns:
-        cat_df = cat_df.loc[cat_df["is_active"].apply(parse_boolish_active) == True].copy()
-    cat_df["category_id"] = pd.to_numeric(cat_df.get("category_id", 0), errors="coerce").fillna(0).astype(int)
-    cat_df["name"] = cat_df.get("name", "").fillna("").astype(str)
-
-    cat_names = [c for c in cat_df["name"].tolist() if str(c).strip()]
-    cat_id_to_name = dict(zip(cat_df["category_id"].tolist(), cat_df["name"].tolist()))
-
-    # Day entries/payments
-    e_day = entries.copy()
-    p_day = payments.copy()
-
-    if not e_day.empty:
-        e_day["date"] = pd.to_datetime(e_day["date"], errors="coerce").dt.date
-        e_day = e_day.loc[e_day["date"] == dash_day].copy()
-        e_day["retailer_id"] = pd.to_numeric(e_day.get("retailer_id", 0), errors="coerce").fillna(0).astype(int)
-        e_day["category_id"] = pd.to_numeric(e_day.get("category_id", 0), errors="coerce").fillna(0).astype(int)
-        e_day["qty"] = pd.to_numeric(e_day.get("qty", 0.0), errors="coerce").fillna(0.0).astype(float)
-        e_day["Category"] = e_day["category_id"].map(cat_id_to_name).fillna("").astype(str)
-    else:
-        e_day = pd.DataFrame(columns=["retailer_id", "category_id", "qty", "Category"])
-
-    if not p_day.empty:
-        p_day["date"] = pd.to_datetime(p_day["date"], errors="coerce").dt.date
-        p_day = p_day.loc[p_day["date"] == dash_day].copy()
-        p_day["retailer_id"] = pd.to_numeric(p_day.get("retailer_id", 0), errors="coerce").fillna(0).astype(int)
-        p_day["amount"] = pd.to_numeric(p_day.get("amount", 0.0), errors="coerce").fillna(0.0).astype(float)
-    else:
-        p_day = pd.DataFrame(columns=["retailer_id", "amount"])
-
-    # Retailer lookup
-    rmap = retailers.copy()
-    if not rmap.empty:
-        rmap["retailer_id"] = pd.to_numeric(rmap.get("retailer_id", 0), errors="coerce").fillna(0).astype(int)
-        rmap["name"] = rmap.get("name", "").fillna("").astype(str)
-        rmap["zone"] = rmap.get("zone", "Default").fillna("Default").astype(str).apply(_norm_zone)
-
-    # ---------------- Zone totals (rows = zones) ----------------
-    zone_pivot = pd.DataFrame()
-    zone_pay = pd.Series(dtype=float)
-
-    if (not e_day.empty) and (not rmap.empty):
-        e_zone = e_day.merge(rmap[["retailer_id", "zone"]], on="retailer_id", how="left")
-        e_zone["zone"] = e_zone["zone"].fillna("Default").astype(str).apply(_norm_zone)
-        e_zone = e_zone.loc[e_zone["Category"].astype(str).str.len() > 0].copy()
-        if not e_zone.empty:
-            zone_pivot = pd.pivot_table(
-                e_zone,
-                index="zone",
-                columns="Category",
-                values="qty",
-                aggfunc="sum",
-                fill_value=0.0,
-            )
-
-    if (not p_day.empty) and (not rmap.empty):
-        p_zone = p_day.merge(rmap[["retailer_id", "zone"]], on="retailer_id", how="left")
-        p_zone["zone"] = p_zone["zone"].fillna("Default").astype(str).apply(_norm_zone)
-        if not p_zone.empty:
-            zone_pay = p_zone.groupby("zone")["amount"].sum()
-
-    if not zone_pivot.empty:
-        for c in cat_names:
-            if c not in zone_pivot.columns:
-                zone_pivot[c] = 0.0
-        zone_pivot = zone_pivot.reindex(columns=cat_names, fill_value=0.0)
-        zone_pivot["TOTAL (L)"] = zone_pivot.sum(axis=1)
-        zone_pivot["Payment (₹)"] = zone_pay.reindex(zone_pivot.index).fillna(0.0).astype(float)
-
-    # ---------------- Main retailers (rows = retailers) ----------------
-    main_ids = set(get_main_retailer_ids())
-    # Also include retailers whose zone is literally "Main" (optional compatibility)
-    if not rmap.empty:
-        main_ids |= set(rmap.loc[rmap["zone"] == _norm_zone(MAIN_ZONE), "retailer_id"].astype(int).tolist())
-
-    main_pivot = pd.DataFrame()
-    main_pay_map = {}
-
-    if main_ids and (not rmap.empty):
-        main_r = rmap.loc[rmap["retailer_id"].astype(int).isin(list(main_ids))].copy()
-
-        if not main_r.empty and not e_day.empty:
-            e_main = e_day.loc[e_day["retailer_id"].astype(int).isin(main_r["retailer_id"].astype(int))].copy()
-            e_main = e_main.merge(main_r[["retailer_id", "name"]], on="retailer_id", how="left").rename(columns={"name": "Retailer"})
-            e_main = e_main.loc[e_main["Category"].astype(str).str.len() > 0].copy()
-            if not e_main.empty:
-                main_pivot = pd.pivot_table(
-                    e_main,
-                    index="Retailer",
-                    columns="Category",
-                    values="qty",
-                    aggfunc="sum",
-                    fill_value=0.0,
-                )
-
-        if not p_day.empty and not main_r.empty:
-            p_main = p_day.loc[p_day["retailer_id"].astype(int).isin(main_r["retailer_id"].astype(int))].copy()
-            if not p_main.empty:
-                p_main = p_main.merge(main_r[["retailer_id", "name"]], on="retailer_id", how="left")
-                main_pay_map = p_main.groupby("name")["amount"].sum().to_dict()
-
-    if not main_pivot.empty:
-        for c in cat_names:
-            if c not in main_pivot.columns:
-                main_pivot[c] = 0.0
-        main_pivot = main_pivot.reindex(columns=cat_names, fill_value=0.0)
-        main_pivot["TOTAL (L)"] = main_pivot.sum(axis=1)
-        main_pivot["Payment (₹)"] = [float(main_pay_map.get(idx, 0.0)) for idx in main_pivot.index]
-
-    # ---------------- Combine into one display table ----------------
-    out_cols = ["Name"] + cat_names + ["TOTAL (L)", "Payment (₹)"]
-    frames = []
-
-    # ZONE totals first
-    if not zone_pivot.empty:
-        zdf = zone_pivot.copy().sort_index()
-        zdf.insert(0, "Name", zdf.index.astype(str))
-        zdf = zdf.reset_index(drop=True)
-        frames.append(zdf[out_cols])
-
-    # Divider
-    if (not main_pivot.empty) and frames:
-        frames.append(pd.DataFrame([{c: "–" for c in out_cols}]))
-
-    # Main retailers after zones
-    if not main_pivot.empty:
-        mdf = main_pivot.copy().sort_index()
-        mdf.insert(0, "Name", mdf.index.astype(str))
-        mdf = mdf.reset_index(drop=True)
-        frames.append(mdf[out_cols])
-
-    # GRAND TOTAL at bottom (computed from zones only to avoid double count)
-    if not zone_pivot.empty:
-        grand = {"Name": "GRAND TOTAL"}
-        for c in cat_names:
-            grand[c] = float(pd.to_numeric(zone_pivot.get(c, 0.0), errors="coerce").fillna(0.0).sum())
-        grand["TOTAL (L)"] = float(pd.to_numeric(zone_pivot.get("TOTAL (L)", 0.0), errors="coerce").fillna(0.0).sum())
-        grand["Payment (₹)"] = float(pd.to_numeric(zone_pivot.get("Payment (₹)", 0.0), errors="coerce").fillna(0.0).sum())
-        frames.append(pd.DataFrame([grand])[out_cols])
-
-    if not frames:
-        st.info("No entries/payments found for this date.")
-    else:
-        out = pd.concat(frames, ignore_index=True)
-        disp = out.copy()
-        for c in cat_names + ["TOTAL (L)"]:
-            disp[c] = disp[c].apply(fmt_zero_dash)
-        disp["Payment (₹)"] = disp["Payment (₹)"].apply(fmt_zero_dash)
-        st.dataframe(df_for_display(disp), width="stretch")
-        
-    # ---------------- Distributors table (datewise, per distributor) ----------------
-    st.subheader("🚚 Distributors — Daily Summary")
-    dp_day = dist_purchases.copy()
-    dpay_day = dist_payments.copy()
-    dmap = distributors.copy()
-
-    if not dp_day.empty:
-        dp_day["date"] = pd.to_datetime(dp_day["date"], errors="coerce").dt.date
-        dp_day = dp_day.loc[dp_day["date"] == dash_day].copy()
-        dp_day["distributor_id"] = pd.to_numeric(dp_day.get("distributor_id", 0), errors="coerce").fillna(0).astype(int)
-        dp_day["qty"] = pd.to_numeric(dp_day.get("qty", 0.0), errors="coerce").fillna(0.0).astype(float)
-        dp_day["amount"] = pd.to_numeric(dp_day.get("amount", 0.0), errors="coerce").fillna(0.0).astype(float)
-    else:
-        dp_day = pd.DataFrame(columns=["distributor_id","qty","amount"])
-
-    if not dpay_day.empty:
-        dpay_day["date"] = pd.to_datetime(dpay_day["date"], errors="coerce").dt.date
-        dpay_day = dpay_day.loc[dpay_day["date"] == dash_day].copy()
-        dpay_day["distributor_id"] = pd.to_numeric(dpay_day.get("distributor_id", 0), errors="coerce").fillna(0).astype(int)
-        dpay_day["amount"] = pd.to_numeric(dpay_day.get("amount", 0.0), errors="coerce").fillna(0.0).astype(float)
-    else:
-        dpay_day = pd.DataFrame(columns=["distributor_id","amount"])
-
-    if not dmap.empty:
-        dmap["distributor_id"] = pd.to_numeric(dmap.get("distributor_id", 0), errors="coerce").fillna(0).astype(int)
-        dmap["name"] = dmap.get("name", "").fillna("").astype(str)
-
-    if dp_day.empty and dpay_day.empty:
-        st.info("No distributor purchases/payments for this date.")
-    else:
-        pur = dp_day.groupby("distributor_id").agg({"qty":"sum","amount":"sum"}).rename(columns={"qty":"Purchased (L)","amount":"Purchase Amount (₹)"})
-        pay = dpay_day.groupby("distributor_id").agg({"amount":"sum"}).rename(columns={"amount":"Paid (₹)"})
-        dsum = pur.join(pay, how="outer").fillna(0.0)
-        if not dmap.empty:
-            dsum = dsum.reset_index().merge(dmap[["distributor_id","name"]], on="distributor_id", how="left").rename(columns={"name":"Distributor"})
-        else:
-            dsum = dsum.reset_index()
-            dsum["Distributor"] = dsum["distributor_id"].astype(str)
-        dsum["Outstanding (₹)"] = pd.to_numeric(dsum["Purchase Amount (₹)"], errors="coerce").fillna(0.0) - pd.to_numeric(dsum["Paid (₹)"], errors="coerce").fillna(0.0)
-        dsum = dsum[["Distributor","Purchased (L)","Purchase Amount (₹)","Paid (₹)","Outstanding (₹)"]].sort_values("Purchase Amount (₹)", ascending=False)
-        st.dataframe(dsum.style.format({"Purchased (L)":"{:.2f}","Purchase Amount (₹)":"₹{:.2f}","Paid (₹)":"₹{:.2f}","Outstanding (₹)":"₹{:.2f}"}), width="stretch")
-
-    # ---------- GRAND TOTAL row under Distributors — Daily Summary ----------
-    # Paste this RIGHT BELOW the st.dataframe(...) that shows the distributor daily summary
-
-    _dist_df = None
-    for _name, _val in list(locals().items()):
-        if isinstance(_val, pd.DataFrame) and not _val.empty:
-            cols = set(map(str, _val.columns))
-            if {"Distributor", "Purchased (L)", "Purchase Amount (₹)", "Paid (₹)", "Outstanding (₹)"} <= cols:
-                _dist_df = _val
-                break
-
-    if isinstance(_dist_df, pd.DataFrame) and not _dist_df.empty:
-        df = _dist_df.copy()
-
-        # numeric safety
-        for col in ["Purchased (L)", "Purchase Amount (₹)", "Paid (₹)", "Outstanding (₹)"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-        grand = {
-            "Distributor": "GRAND TOTAL",
-            "Purchased (L)": float(df["Purchased (L)"].sum()),
-            "Purchase Amount (₹)": float(df["Purchase Amount (₹)"].sum()),
-            "Paid (₹)": float(df["Paid (₹)"].sum()),
-            "Outstanding (₹)": float(df["Outstanding (₹)"].sum()),
-        }
-
-        grand_df = pd.DataFrame([grand])
-
-        # format like your UI
-        grand_df["Purchased (L)"] = grand_df["Purchased (L)"].apply(lambda x: fmt_zero_dash(x))
-        for c in ["Purchase Amount (₹)", "Paid (₹)", "Outstanding (₹)"]:
-            grand_df[c] = grand_df[c].apply(lambda x: _fmt_money(float(x)))
-
-        st.dataframe(df_for_display(grand_df), width="stretch")
-    # ----------------------------------------------------------------------
-
-    st.divider()
-
-    # ================== DAILY SUMMARY (Print-ready) ==================
     st.subheader("📅 Daily Summary Sheet (Zones + Main Book Retailers)")
     dash_day = st.date_input("Select Date", value=date.today(), key="dash_day_summary")
 
@@ -2892,46 +2571,6 @@ if menu == "📊 Dashboard":
             width="stretch",
         )
 
-
-    # ---------- GRAND TOTAL row under Distributors — Daily Summary ----------
-    # Paste this RIGHT BELOW the st.dataframe(...) that shows the distributor daily summary
-
-    _dist_df = None
-    for _name, _val in list(locals().items()):
-        if isinstance(_val, pd.DataFrame) and not _val.empty:
-            cols = set(map(str, _val.columns))
-            if {"Distributor", "Purchased (L)", "Purchase Amount (₹)", "Paid (₹)", "Outstanding (₹)"} <= cols:
-                _dist_df = _val
-                break
-
-    if isinstance(_dist_df, pd.DataFrame) and not _dist_df.empty:
-        df = _dist_df.copy()
-
-        # numeric safety
-        for col in ["Purchased (L)", "Purchase Amount (₹)", "Paid (₹)", "Outstanding (₹)"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-        grand = {
-            "Distributor": "GRAND TOTAL",
-            "Purchased (L)": float(df["Purchased (L)"].sum()),
-            "Purchase Amount (₹)": float(df["Purchase Amount (₹)"].sum()),
-            "Paid (₹)": float(df["Paid (₹)"].sum()),
-            "Outstanding (₹)": float(df["Outstanding (₹)"].sum()),
-        }
-
-        grand_df = pd.DataFrame([grand])
-
-        # format like your UI
-        grand_df["Purchased (L)"] = grand_df["Purchased (L)"].apply(lambda x: fmt_zero_dash(x))
-        for c in ["Purchase Amount (₹)", "Paid (₹)", "Outstanding (₹)"]:
-            grand_df[c] = grand_df[c].apply(lambda x: _fmt_money(float(x)))
-
-        st.dataframe(df_for_display(grand_df), width="stretch")
-    # ----------------------------------------------------------------------
-
-    st.divider()
-
-
     # ---- Build HTML report + Download ----
     pay_modes = pd.DataFrame(columns=["Mode", "Total (₹)"])
     if not p_day.empty:
@@ -3153,6 +2792,8 @@ if menu == "📊 Dashboard":
 
         st.caption("Sales are zone-filtered. Purchases/wastage are not zone-filtered in current model.")
 
+    st.divider()
+
 elif menu == "📝 Daily Posting Sheet (Excel)":
     st.header("📝 Daily Posting Sheet — Retailers + Distributors + Wastage (Single Save)")
 
@@ -3294,34 +2935,27 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
                 pass
             raise e
 
-    # ---------------- RETAILER EDITOR (LIVE PREVIEW) ----------------
-    # NOTE: st.form prevents reruns while typing, which freezes the preview.
-    # We intentionally keep the editor OUTSIDE a form so each edit triggers a rerun and the preview updates.
+    # ---------------- RETAILER EDITOR IN A FORM (prevents reruns while typing) ----------------
     lock = bool(st.session_state.get("daily_save_lock", False))
     if lock:
         st.info("Saving… please do not interact with the page.")
 
+    form_key = f"daily_form_{ctx}_{st.session_state.get('data_version', 0)}"
     editor_key = f"daily_sheet_editor_{ctx}_{st.session_state.get('data_version', 0)}"
 
-    edited = st.data_editor(
-        st.session_state["daily_drafts"][ctx],
-        width="stretch",
-        num_rows="fixed",
-        key=editor_key,
-        disabled=lock,
-    )
+    with st.form(form_key, clear_on_submit=False):
+        edited = st.data_editor(
+            draft_df,
+            width="stretch",
+            num_rows="fixed",
+            key=editor_key,
+            disabled=lock,
+        )
 
-    # Persist the latest editor state for this (date, zone) context on every rerun.
-    if isinstance(edited, pd.DataFrame):
+        do_save_all = st.form_submit_button("💾 Save (Retailers + Distributors + Wastage)", type="primary", disabled=lock)
+
+    if do_save_all and isinstance(edited, pd.DataFrame):
         st.session_state["daily_drafts"][ctx] = edited.copy()
-
-    do_save_all = st.button(
-        "💾 Save (Retailers + Distributors + Wastage)",
-        type="primary",
-        disabled=lock,
-        key=f"daily_save_{ctx}_{st.session_state.get('data_version', 0)}",
-    )
-
 
     # ---------------- PREVIEW (computed from draft, not from globals) ----------------
     preview_df = st.session_state["daily_drafts"][ctx].copy()
@@ -3368,6 +3002,27 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
     # Computed from the in-memory preview derived from current draft for (date, zone).
     # No DB reads here; safe against cross-date contamination.
     st.subheader("🧾 Totals (Daily)")
+    # Build safe columns for totals in this section
+    preview_df = preview.copy() if "preview" in locals() else pd.DataFrame()
+    # Ensure cat_names is available in this scope (Billing/Preview totals safety)
+    if "cat_names" not in locals() or not isinstance(cat_names, list):
+        _cn = []
+        try:
+            if "cat_cols" in locals() and isinstance(cat_cols, list) and len(cat_cols) > 0:
+                for _m in cat_cols:
+                    if isinstance(_m, dict):
+                        _n = _m.get("name") or _m.get("Category")
+                        if not _n and isinstance(_m.get("col"), str):
+                            _n = _m["col"].replace(" Qty", "").strip()
+                        if _n:
+                            _cn.append(str(_n).strip())
+            if (not _cn) and ("categories" in locals()) and hasattr(categories, "empty") and (not categories.empty) and ("name" in categories.columns):
+                _cn = categories["name"].dropna().astype(str).tolist()
+        except Exception:
+            _cn = []
+        # de-dup, keep stable order
+        cat_names = list(dict.fromkeys([c for c in _cn if str(c).strip()]))
+    cat_col_names = [f"{cat} Qty" for cat in cat_names if (not preview_df.empty and f"{cat} Qty" in preview_df.columns)]
     # Category totals (L)
     cat_totals = {}
     for col in cat_col_names:
@@ -3385,20 +3040,11 @@ elif menu == "📝 Daily Posting Sheet (Excel)":
 
     cgt1, cgt2 = st.columns(2)
     cgt1.metric("Total Milk (L)", f"{grand_qty:.2f}")
-    cgt2.metric("Payments Collected (₹)", f"₹{grand_pay:.2f}")
-
-    # Detailed category totals row (dash for zeros)
+    cgt2.metric("Payments Collected (₹)", f"₹{grand_pay:.2f}")    # Detailed category totals row (dash for zeros)
     if cat_col_names:
-        cid_to_name = {int(c["category_id"]): str(c["name"]) for _, c in categories_active.iterrows()} if "category_id" in categories_active.columns else {}
-        # Try map by meta if available
-        name_by_col = {}
-        for meta in cat_cols:
-            if meta.get("col") and meta.get("name"):
-                name_by_col[str(meta["col"])] = str(meta["name"])
-
         row = {"Category Totals": "TOTAL (L)"}
         for col in cat_col_names:
-            label = name_by_col.get(col, col)
+            label = str(col).replace(" Qty", "")
             row[label] = cat_totals.get(col, 0.0)
         row["GRAND TOTAL (L)"] = grand_qty
 
@@ -4101,11 +3747,20 @@ elif menu == "🏪 Retailers":
                 st.warning("Retailer name required")
             else:
                 z = _norm_zone(zone)
-                rid = sb_new_id("retailers", "retailer_id")
-                new_row = pd.DataFrame([[rid, name.strip(), contact, address, z, True]], columns=CSV_SCHEMAS[RETAILERS_FILE])
-                sb_insert_df(new_row, RETAILERS_FILE)
-                st.success(f"✅ Retailer '{name}' added to zone '{z}'!")
-                st.rerun()
+
+                new_row = pd.DataFrame([{
+                    "name": name.strip(),
+                    "contact": contact,
+                    "address": address,
+                    "zone": z,
+                    "is_active": True
+                }])
+
+            sb_insert_df(new_row, RETAILERS_FILE)
+
+            st.success(f"✅ Retailer '{name}' added to zone '{z}'!")
+            st.rerun()
+
 
     with tab2:
         if retailers.empty:
@@ -4269,9 +3924,15 @@ elif menu == "💰 Price Management":
                 else:
                     target_retailer_id = GLOBAL_RETAILER_ID
 
-                pid = sb_new_id("prices", "price_id")
-                new_row = pd.DataFrame([[pid, int(target_retailer_id), int(cid), float(price_val), str(effective_date)]], columns=CSV_SCHEMAS[PRICES_FILE])
+                new_row = pd.DataFrame([{
+                    "retailer_id": int(target_retailer_id),
+                    "category_id": int(cid),
+                    "price": float(price_val),
+                    "effective_date": str(effective_date)
+                }])
+                
                 sb_insert_df(new_row, PRICES_FILE)
+
                 st.success("✅ Price saved. New entries on/after effective date will use it.")
                 st.rerun()
 
@@ -4642,6 +4303,27 @@ elif menu == "📒 Distributor Ledger":
     # Computed from the in-memory preview derived from current draft for (date, zone).
     # No DB reads here; safe against cross-date contamination.
     st.subheader("🧾 Totals (Daily)")
+    # Build safe columns for totals in this section
+    preview_df = preview.copy() if "preview" in locals() else pd.DataFrame()
+    # Ensure cat_names is available in this scope (Billing/Preview totals safety)
+    if "cat_names" not in locals() or not isinstance(cat_names, list):
+        _cn = []
+        try:
+            if "cat_cols" in locals() and isinstance(cat_cols, list) and len(cat_cols) > 0:
+                for _m in cat_cols:
+                    if isinstance(_m, dict):
+                        _n = _m.get("name") or _m.get("Category")
+                        if not _n and isinstance(_m.get("col"), str):
+                            _n = _m["col"].replace(" Qty", "").strip()
+                        if _n:
+                            _cn.append(str(_n).strip())
+            if (not _cn) and ("categories" in locals()) and hasattr(categories, "empty") and (not categories.empty) and ("name" in categories.columns):
+                _cn = categories["name"].dropna().astype(str).tolist()
+        except Exception:
+            _cn = []
+        # de-dup, keep stable order
+        cat_names = list(dict.fromkeys([c for c in _cn if str(c).strip()]))
+    cat_col_names = [f"{cat} Qty" for cat in cat_names if (not preview_df.empty and f"{cat} Qty" in preview_df.columns)]
     # Category totals (L)
     cat_totals = {}
     for col in cat_col_names:
@@ -4659,20 +4341,11 @@ elif menu == "📒 Distributor Ledger":
 
     cgt1, cgt2 = st.columns(2)
     cgt1.metric("Total Milk (L)", f"{grand_qty:.2f}")
-    cgt2.metric("Payments Collected (₹)", f"₹{grand_pay:.2f}")
-
-    # Detailed category totals row (dash for zeros)
+    cgt2.metric("Payments Collected (₹)", f"₹{grand_pay:.2f}")    # Detailed category totals row (dash for zeros)
     if cat_col_names:
-        cid_to_name = {int(c["category_id"]): str(c["name"]) for _, c in categories_active.iterrows()} if "category_id" in categories_active.columns else {}
-        # Try map by meta if available
-        name_by_col = {}
-        for meta in cat_cols:
-            if meta.get("col") and meta.get("name"):
-                name_by_col[str(meta["col"])] = str(meta["name"])
-
         row = {"Category Totals": "TOTAL (L)"}
         for col in cat_col_names:
-            label = name_by_col.get(col, col)
+            label = str(col).replace(" Qty", "")
             row[label] = cat_totals.get(col, 0.0)
         row["GRAND TOTAL (L)"] = grand_qty
 
@@ -4766,6 +4439,27 @@ elif menu == "🧾 Distributor Bill":
     # Computed from the in-memory preview derived from current draft for (date, zone).
     # No DB reads here; safe against cross-date contamination.
     st.subheader("🧾 Totals (Daily)")
+    # Build safe columns for totals in this section
+    preview_df = preview.copy() if "preview" in locals() else pd.DataFrame()
+    # Ensure cat_names is available in this scope (Billing/Preview totals safety)
+    if "cat_names" not in locals() or not isinstance(cat_names, list):
+        _cn = []
+        try:
+            if "cat_cols" in locals() and isinstance(cat_cols, list) and len(cat_cols) > 0:
+                for _m in cat_cols:
+                    if isinstance(_m, dict):
+                        _n = _m.get("name") or _m.get("Category")
+                        if not _n and isinstance(_m.get("col"), str):
+                            _n = _m["col"].replace(" Qty", "").strip()
+                        if _n:
+                            _cn.append(str(_n).strip())
+            if (not _cn) and ("categories" in locals()) and hasattr(categories, "empty") and (not categories.empty) and ("name" in categories.columns):
+                _cn = categories["name"].dropna().astype(str).tolist()
+        except Exception:
+            _cn = []
+        # de-dup, keep stable order
+        cat_names = list(dict.fromkeys([c for c in _cn if str(c).strip()]))
+    cat_col_names = [f"{cat} Qty" for cat in cat_names if (not preview_df.empty and f"{cat} Qty" in preview_df.columns)]
     # Category totals (L)
     cat_totals = {}
     for col in cat_col_names:
@@ -4783,20 +4477,11 @@ elif menu == "🧾 Distributor Bill":
 
     cgt1, cgt2 = st.columns(2)
     cgt1.metric("Total Milk (L)", f"{grand_qty:.2f}")
-    cgt2.metric("Payments Collected (₹)", f"₹{grand_pay:.2f}")
-
-    # Detailed category totals row (dash for zeros)
+    cgt2.metric("Payments Collected (₹)", f"₹{grand_pay:.2f}")    # Detailed category totals row (dash for zeros)
     if cat_col_names:
-        cid_to_name = {int(c["category_id"]): str(c["name"]) for _, c in categories_active.iterrows()} if "category_id" in categories_active.columns else {}
-        # Try map by meta if available
-        name_by_col = {}
-        for meta in cat_cols:
-            if meta.get("col") and meta.get("name"):
-                name_by_col[str(meta["col"])] = str(meta["name"])
-
         row = {"Category Totals": "TOTAL (L)"}
         for col in cat_col_names:
-            label = name_by_col.get(col, col)
+            label = str(col).replace(" Qty", "")
             row[label] = cat_totals.get(col, 0.0)
         row["GRAND TOTAL (L)"] = grand_qty
 
@@ -4933,7 +4618,7 @@ elif menu == "💼 Expenses":
                             st.rerun()
 
 # ================== GENERATE BILL ==================
-elif menu == "🧾 Generate Bill":
+elif menu == "🧾 Retailers Bill":
     st.header("🧾 Generate Professional Customer Bill (Printable + Downloadable)")
 
     if retailers.empty:
@@ -5051,6 +4736,27 @@ elif menu == "🧾 Generate Bill":
     # Computed from the in-memory preview derived from current draft for (date, zone).
     # No DB reads here; safe against cross-date contamination.
     st.subheader("🧾 Totals (Daily)")
+    # Build safe columns for totals in this section
+    preview_df = preview.copy() if "preview" in locals() else pd.DataFrame()
+    # Ensure cat_names is available in this scope (Billing/Preview totals safety)
+    if "cat_names" not in locals() or not isinstance(cat_names, list):
+        _cn = []
+        try:
+            if "cat_cols" in locals() and isinstance(cat_cols, list) and len(cat_cols) > 0:
+                for _m in cat_cols:
+                    if isinstance(_m, dict):
+                        _n = _m.get("name") or _m.get("Category")
+                        if not _n and isinstance(_m.get("col"), str):
+                            _n = _m["col"].replace(" Qty", "").strip()
+                        if _n:
+                            _cn.append(str(_n).strip())
+            if (not _cn) and ("categories" in locals()) and hasattr(categories, "empty") and (not categories.empty) and ("name" in categories.columns):
+                _cn = categories["name"].dropna().astype(str).tolist()
+        except Exception:
+            _cn = []
+        # de-dup, keep stable order
+        cat_names = list(dict.fromkeys([c for c in _cn if str(c).strip()]))
+    cat_col_names = [f"{cat} Qty" for cat in cat_names if (not preview_df.empty and f"{cat} Qty" in preview_df.columns)]
     # Category totals (L)
     cat_totals = {}
     for col in cat_col_names:
@@ -5068,20 +4774,11 @@ elif menu == "🧾 Generate Bill":
 
     cgt1, cgt2 = st.columns(2)
     cgt1.metric("Total Milk (L)", f"{grand_qty:.2f}")
-    cgt2.metric("Payments Collected (₹)", f"₹{grand_pay:.2f}")
-
-    # Detailed category totals row (dash for zeros)
+    cgt2.metric("Payments Collected (₹)", f"₹{grand_pay:.2f}")    # Detailed category totals row (dash for zeros)
     if cat_col_names:
-        cid_to_name = {int(c["category_id"]): str(c["name"]) for _, c in categories_active.iterrows()} if "category_id" in categories_active.columns else {}
-        # Try map by meta if available
-        name_by_col = {}
-        for meta in cat_cols:
-            if meta.get("col") and meta.get("name"):
-                name_by_col[str(meta["col"])] = str(meta["name"])
-
         row = {"Category Totals": "TOTAL (L)"}
         for col in cat_col_names:
-            label = name_by_col.get(col, col)
+            label = str(col).replace(" Qty", "")
             row[label] = cat_totals.get(col, 0.0)
         row["GRAND TOTAL (L)"] = grand_qty
 
