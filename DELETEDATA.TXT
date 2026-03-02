@@ -1,0 +1,29 @@
+- ==============================
+-- DELETE ALL TRANSACTIONAL DATA
+-- ==============================
+
+DELETE FROM entries;
+DELETE FROM payments;
+DELETE FROM distributor_purchases;
+DELETE FROM distributor_payments;
+DELETE FROM wastage;
+DELETE FROM expenses;
+
+-- ==============================
+-- DELETE PRICES AFTER 2026-03-01
+-- ==============================
+
+DELETE FROM prices
+WHERE effective_date > '2026-03-01';
+
+-- ==============================
+-- OPTIONAL: RESET SEQUENCES
+-- (only if needed, safe)
+-- ==============================
+
+ALTER SEQUENCE entries_entry_id_seq RESTART WITH 1;
+ALTER SEQUENCE payments_payment_id_seq RESTART WITH 1;
+ALTER SEQUENCE distributor_purchases_purchase_id_seq RESTART WITH 1;
+ALTER SEQUENCE distributor_payments_payment_id_seq RESTART WITH 1;
+ALTER SEQUENCE wastage_wastage_id_seq RESTART WITH 1;
+ALTER SEQUENCE expenses_expense_id_seq RESTART WITH 1;
